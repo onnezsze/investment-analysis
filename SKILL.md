@@ -1,7 +1,7 @@
 ---
 name: investment-analysis
-description: "Institutional stock analysis: fundamentals & technicals."
-version: 1.0.0
+description: "Institutional stock & crypto analysis: fundamentals, technicals & tokenomics."
+version: 1.2.0
 author: Lucas (htxlucas), Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -21,6 +21,7 @@ metadata:
 - 用户说 "分析 / 看一下 / 调研 / 研究 某只股票"，要一份机构级别报告。
 - 用户点名要用 **基本面** 或 **技术面** 模板。
 - 用户给了股票代码/名称（美股、港股、A股均可），并要求多角色深度分析。
+- 用户说 分析某加密代币/币种（BTC / ETH / SOL / 主流币 / Alt），要机构级报告 → 用 `references/crypto.md`（含 Tokenomics / 链上数据 / 衍生品 / 加密技术面）。
 - 用户说 "用投资分析模板 / 跑一遍投研流程"。
 
 **Don't use for:** 简单的行情查询（只需要当前价格/涨跌幅）；DCF/估值单一指标速算；不需要结构化报告的一次性问答。
@@ -42,10 +43,17 @@ metadata:
 
 - 基本面模板：`references/fundamentals.md` — 分析师情报、多空辩论、交易执行、CIO 审批。
 - 技术面模板：`references/technical.md` — 风险前置、量化仪表盘、多周期共振、相对强度、交易剧本。
+- 加密模板：`references/crypto.md` — Tokenomics、链上数据、衍生品/资金费率/OI、ETF 与稳定币流向、加密技术面（vs BTC 相对强弱、BTC.D）。
 - 跨端通用 Prompt：`prompts/fundamentals-prompt.md`、`prompts/technical-prompt.md` — 纯正文、复制即用，可直接粘给 Claude / GPT / 任何大模型。
 - 关键工具：`web_search`、`web_extract`、`browser_exec`（抓新闻/财报/行情/机构持仓）。
 
 ## Procedure（执行步骤）
+
+### 加密货币分析（crypto.md）
+1. 确认币种（BTC/ETH/SOL/Alt）与市场（现货/合约、交易所）。
+2. 用 `web_search`/`web_extract`/`browser_exec` 抓加密特有数据：CoinGecko（价格/市值/FDV/流通量）、解锁日历、资金费率/OI、ETF 与稳定币流向、链上数据、恐惧贪婪指数、监管/宏观新闻。
+3. 按 crypto.md 产出：①通证与协议基本面 ②链上/衍生品资金面 ③新闻/宏观/监管 ④情绪资金流 ⑤加密技术面（相对强弱 vs BTC）。含多空辩论、执行计划、CIO 审批。
+4. 数据必须真实回溯，禁止编造数字；重点核查爆仓/解锁/资金费率等加密特有指标。
 
 ### 基本面全流程（fundamentals.md）
 1. **确认真实数据来源**：用 `web_search`/`web_extract` 取公司财务数据、财报、分析师评级、13F 持仓、行业与监管新闻、宏观指标、社交/员工口碑数据。
