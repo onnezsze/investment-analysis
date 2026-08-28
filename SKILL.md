@@ -42,6 +42,7 @@ metadata:
 
 - 基本面模板：`references/fundamentals.md` — 分析师情报、多空辩论、交易执行、CIO 审批。
 - 技术面模板：`references/technical.md` — 风险前置、量化仪表盘、多周期共振、相对强度、交易剧本。
+- 跨端通用 Prompt：`prompts/fundamentals-prompt.md`、`prompts/technical-prompt.md` — 纯正文、复制即用，可直接粘给 Claude / GPT / 任何大模型。
 - 关键工具：`web_search`、`web_extract`、`browser_exec`（抓新闻/财报/行情/机构持仓）。
 
 ## Procedure（执行步骤）
