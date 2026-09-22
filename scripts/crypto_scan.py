@@ -323,21 +323,41 @@ def main() -> int:
 
     for r in rows:
         r["opportunity_score"] = score(r)
-    rows.sort(key=lambda x: -x["opportunity_score"])
+    # ── 类内排名：跨类绝对分不可比（tradfi 的流动性权重 40 vs 加密 15，且加密的热度/OI 项只有上榜才有分）
+    #    实测：crypto 候选 63 个却只有 6 个挤进前 60 —— 故改为「类内分位」为主排序键
+    for klass in ("crypto", "tradfi"):
+        g = sorted([r for r in rows if r.get("asset_class") == klass and r["tradability"] == "可交易"],
+                   key=lambda x: -x["opportunity_score"])
+        n = len(g)
+        for i, r in enumerate(g, 1):
+            r["class_rank"] = i
+            r["class_size"] = n
+            r["class_pct"] = round((n - i + 1) / n * 100, 1) if n else 0.0
+    rows.sort(key=lambda x: (-(x.get("class_pct") or 0), -(x.get("opportunity_score") or 0)))
     if a.only:
         rows = [r for r in rows if r.get("asset_class") == a.only or r["tradability"] != "可交易"]
     top = rows[:a.top]
-    # 落盘保留更深的名次（默认 60），否则某一类会被整体挤出（实测：前 24 名里只有 1 个加密）
-    save_rows = rows[:max(a.top, a.save_top)]
+    # 落盘：各类各保留前 N 名（默认 40），彻底避免某一类被整体挤出
+    per = max(a.top, a.save_top)
+    save_rows, seen = [], {"crypto": 0, "tradfi": 0}
+    for r in rows:
+        k = r.get("asset_class") if r.get("asset_class") in seen else "crypto"
+        if r["tradability"] != "可交易":
+            continue
+        if seen[k] < per:
+            save_rows.append(r)
+            seen[k] += 1
+    for r in rows:                                  # 不可交易的也留档（便于排查）
+        if r["tradability"] != "可交易":
+            save_rows.append(r)
 
-    print(f"\n{'标的':10} {'类别':7} {'场所':8} {'合约':16} {'机会分':>6} {'24h%':>7} {'成交额(USD)':>13} {'费率年化%':>9} {'来源'}")
-    print("-" * 118)
+    print(f"\n{'标的':10} {'类别':7} {'类内排名':>8} {'分位':>6} {'机会分':>6} {'24h%':>7} {'成交额(USD)':>13} {'来源'}")
+    print("-" * 108)
     for r in top:
-        print(f"{r['raw_symbol']:10} {r.get('asset_class','-'):7} {str(r.get('venue')):8} {str(r.get('contract')):16} "
+        cr = f"{r.get('class_rank','-')}/{r.get('class_size','-')}"
+        print(f"{r['raw_symbol']:10} {r.get('asset_class','-'):7} {cr:>8} {str(r.get('class_pct')):>6} "
               f"{r['opportunity_score']:>6} {(r.get('change_24h_pct_ex') or r.get('change_24h_pct') or 0):>7.2f} "
-              f"{(r.get('quote_volume_24h_usd') or 0):>13,.0f} "
-              f"{(r.get('funding_annualized_pct') if r.get('funding_annualized_pct') is not None else float('nan')):>9.2f} "
-              f"{','.join(r['sources'])}")
+              f"{(r.get('quote_volume_24h_usd') or 0):>13,.0f} {','.join(r['sources'])}")
 
     day = datetime.now(timezone.utc).strftime("%Y%m%d")
     out = a.out or os.path.join(OUT_DIR, f"watchlist_{day}.json")

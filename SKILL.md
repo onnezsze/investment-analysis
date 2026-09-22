@@ -145,7 +145,9 @@ python3 .../crypto_scan.py --only tradfi           # 只看股票/ETF/商品/外
 - 候选来源：`square-hype`(社交热度) / `oi-divergence`(持仓异动) / `gainers` / `losers` / `hotspots`(Alpha) / `us-stocks`(tradfi 叙事)
 - 可交易性校验：Binance `PERPETUAL`(加密) 与 `TRADIFI_PERPETUAL`(股票/ETF/商品) + HTX 永续；自动处理 1000/1000000 乘数
 - 机会分口径**按资产类别分开**：加密=热度+OI背离+摆幅+费率偏离+流动性；**tradfi=流动性+摆幅+新闻流+费率偏离**（tradfi 无社交热度与 OI 背离）
-- 输出 `~/crypto_snapshots/watchlist_<date>.json`，供 `autotrade.py --scan` 直接消费
+- **⚠️ 跨类绝对分不可比，必须用「类内分位」排序**（实测踩过的坑）：tradfi 的流动性权重 40（全部候选都过成交额门槛 → 单项即得约 30 分）vs 加密只有 15；而加密的分数大头是"社交热度 25 + OI 背离 25"，**只有上了 dogdoing 热度榜/OI 榜的币才有分**（榜单仅 30/19 个名额）。结果：crypto 候选 63 个却只有 **6 个**挤进前 60，扫描实质退化为"只扫美股"。
+  → 现按 `class_pct`（类内分位）排序，落盘时**各类各保留前 40 名**，`load_watchlist` 再按类别轮流取 → `--scan 8` = 4 加密 + 4 tradfi。
+- 输出 `~/crypto_snapshots/watchlist_<date>.json`（含 `class_rank`/`class_size`/`class_pct`），供 `autotrade.py --scan` 直接消费
 
 **步骤**：
 
