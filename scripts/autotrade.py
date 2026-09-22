@@ -33,6 +33,7 @@ import binance_exec as bx      # noqa: E402
 import crypto_decide as cd     # noqa: E402
 
 SWITCH = os.path.expanduser("~/.binance_futures_autotrade.on")
+NO_ENTRY = os.path.expanduser("~/.binance_futures_noentry.on")   # 存在=只管理持仓，不开新仓
 TRADES_LOG = os.path.expanduser("~/crypto_snapshots/trades.jsonl")
 HALT_LOG = os.path.expanduser("~/crypto_snapshots/halt.log")
 # 注：2026-09-22 01:56 首轮真下单时，本记录尚未持久化 TypeSafe 原始返回（answers/state_hash 为 null），
@@ -153,7 +154,8 @@ def manage_positions(positions: dict, live: bool, profile: str, lines: list) -> 
                 act, reason = "CLOSE_PENDING", f"论点消失待确认（{why}）—— 首次读数不平仓，防单次噪声甩单"
         # ③ 论点弱化 → 已盈利则收紧到保本/更优，未盈利则警告（连续两次弱化则平仓）
         elif p_pos < T["weaken_p"] or conf < 0.45:
-            in_profit = (px > entry) if pos_dir == "short" else (px < entry)
+            # 盈利判定：多头=价格高于入场；空头=价格低于入场（此前写反，已在实盘前修正）
+            in_profit = (px > entry) if pos_dir == "long" else (px < entry)
             if in_profit:
                 act, reason = "TIGHTEN", f"论点弱化（概率 {p_pos:.2f}／置信度 {conf}）且已盈利 → 收紧止损"
             else:
@@ -181,9 +183,29 @@ def manage_positions(positions: dict, live: bool, profile: str, lines: list) -> 
                 detail["close_result"] = r
             lines.append(f"\n**{sym}** 持仓 {pos_dir} → **{'已平仓' if live else '[dry-run] 将平仓'}**｜{reason}")
         elif act == "TIGHTEN":
-            new_stop = round(max(entry, px * (1 + 0.5 * atr / 100)), 4) if pos_dir == "short" else \
-                       round(min(entry, px * (1 - 0.5 * atr / 100)), 4)
+            # 只允许"收紧"：止损只能朝减少风险的方向移动，且不得贴到现价（避免立即触发）
+            cur = 0.0
+            for o in bx.open_algo_orders(sym):
+                if o.get("orderType") == "STOP_MARKET":
+                    cur = float(o.get("triggerPrice") or 0)
+            atr_abs = px * atr / 100
+            if pos_dir == "short":
+                desired = min(entry, px + 0.5 * atr_abs)          # 空头：止损在价上方，向下收
+                new_stop = min(cur or desired, desired)
+                if new_stop <= px * 1.002:
+                    new_stop = round(max(px * 1.002, min(cur or desired, desired)), 4)
+            else:
+                desired = max(entry, px - 0.5 * atr_abs)          # 多头：止损在价下方，向上收
+                new_stop = max(cur or desired, desired)
+                if new_stop >= px * 0.998:
+                    new_stop = round(min(px * 0.998, max(cur or desired, desired)), 4)
+            new_stop = round(new_stop, 4)
             detail["tighten_to"] = new_stop
+            detail["prev_stop"] = cur or None
+            detail["atr_abs"] = round(atr_abs, 4)
+            if cur and abs(new_stop - cur) < 1e-9:
+                act, reason = "HOLD", f"论点弱化但止损已是最优（{cur}），无需调整"
+                lines.append(f"\n**{sym}** 持仓 {pos_dir} → 持有｜{reason}")
             if live:
                 detail["cancelled_algo"] = bx.cancel_all_protective(sym)
                 res = bx.place_protective(sym, "sell" if pos_dir == "short" else "buy",
@@ -233,9 +255,16 @@ def main() -> int:
         if a.manage_only:
             print("\n".join(lines))
             return 0
+        if os.path.exists(NO_ENTRY):
+            lines.append("\n### 二、新机会扫描 —— **已暂停**（存在禁止开仓开关，仅管理持仓）")
+            print("\n".join(lines))
+            return 0
         lines.append("\n### 二、新机会扫描")
     elif a.manage_only:
         print(f"**持仓管理 · {ts}** ｜ 空仓，无需管理")
+        return 0
+    elif os.path.exists(NO_ENTRY):
+        print(f"**巡检 · {ts}** ｜ 空仓 + 禁止开仓开关生效 → 无操作")
         return 0
 
     if wallet < a.equity_floor:
