@@ -277,6 +277,7 @@ def main() -> int:
     ap.add_argument("--only", default=None, choices=["crypto", "tradfi"])
     ap.add_argument("--no-enrich", action="store_true", help="跳过逐个补数据（更快，但流动性与费率列会空）")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--save-top", type=int, default=60, help="落盘保留的名次数（默认 60，保证各类别都有候选）")
     a = ap.parse_args()
 
     print("拉取场所合约清单…")
@@ -326,6 +327,8 @@ def main() -> int:
     if a.only:
         rows = [r for r in rows if r.get("asset_class") == a.only or r["tradability"] != "可交易"]
     top = rows[:a.top]
+    # 落盘保留更深的名次（默认 60），否则某一类会被整体挤出（实测：前 24 名里只有 1 个加密）
+    save_rows = rows[:max(a.top, a.save_top)]
 
     print(f"\n{'标的':10} {'类别':7} {'场所':8} {'合约':16} {'机会分':>6} {'24h%':>7} {'成交额(USD)':>13} {'费率年化%':>9} {'来源'}")
     print("-" * 118)
@@ -342,7 +345,7 @@ def main() -> int:
     payload = {"generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
                "counts": {"candidates": len(cands), "tradable": sum(1 for r in rows if r["tradability"] == "可交易"),
                           "binance_perps": len(b), "htx_perps": len(h)},
-               "watchlist": top}
+               "watchlist": save_rows}
     json.dump(payload, open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     n_tr = sum(1 for r in top if r.get("asset_class") == "tradfi")
     print(f"\n[OK] {out}｜可交易 {payload['counts']['tradable']} 个｜榜内 tradfi {n_tr} 个")

@@ -55,16 +55,22 @@ def load_watchlist(n: int, include_tradfi: bool) -> list[dict]:
     if not files:
         return []
     w = json.load(open(files[-1], encoding="utf-8"))
-    out = []
-    for r in w.get("watchlist", []):
-        if r.get("tradability") != "可交易":
+    rows = [r for r in w.get("watchlist", []) if r.get("tradability") == "可交易"]
+    # 按类别分开；再轮流取（按类内名次），避免某一类因绝对分高而把另一类整体挤出
+    groups = {"crypto": [], "tradfi": []}
+    for r in rows:
+        k = r.get("asset_class") if r.get("asset_class") in groups else "crypto"
+        if k == "tradfi" and not include_tradfi:
             continue
-        if r.get("asset_class") == "tradfi" and not include_tradfi:
-            continue
-        out.append({"symbol": r.get("contract"), "venue": r.get("venue"),
-                    "asset_class": r.get("asset_class"), "score": r.get("opportunity_score")})
-        if len(out) >= n:
-            break
+        groups[k].append(r)
+    out, i = [], 0
+    while len(out) < n and (i < len(groups["crypto"]) or i < len(groups["tradfi"])):
+        for k in ("crypto", "tradfi"):
+            if i < len(groups[k]) and len(out) < n:
+                r = groups[k][i]
+                out.append({"symbol": r.get("contract"), "venue": r.get("venue"),
+                            "asset_class": r.get("asset_class"), "score": r.get("opportunity_score")})
+        i += 1
     return out
 
 
@@ -155,11 +161,16 @@ def size_from_plan(wallet: float, risk_frac: float, price: float, stop: float,
             "capped_by_leverage": capped}
 
 
-MAX_CONCURRENT_POSITIONS = 2      # 并发仓位上限（建仓慎重）
+# 并发仓位：不再只看"个数"，而是「个数 + 组合热度(heat) + 相关性簇」三重约束
+# 依据实测相关性矩阵（4H，90根）：MU↔MUU=1.00；半导体簇 {AMD,TSLA,SOXL,INTC} 互相关 0.64-0.81；
+#   7/14 标的是 AI 半导体链。3 笔两两相关 0.55 时组合风险 = 1%×√(3+6×0.55) = 2.51%（独立时 1.73%）。
+MAX_CONCURRENT_POSITIONS = 3      # 并发仓位上限（2→3：可容纳"半导体 + 加密 + 大型互联网"三类真独立敞口）
+MAX_PORTFOLIO_HEAT_PCT = 3.0      # 组合热度上限：所有持仓的当前风险合计 ≤ 权益 3%（自适应的真约束）
+CORR_CLUSTER_MAX = 0.60           # 相关性簇阈值（0.70→0.60：把半导体链算作同一个押注）
 MIN_HOLD_MINUTES = 30             # 护栏1：模型驱动的退出不得早于持仓 30 分钟（防噪声甩单）
 COOLDOWN_HOURS = 6                # 护栏2：同一标的平仓后 6 小时内不再开仓（防 churn 循环）
 MAX_ENTRIES_PER_DAY = 4           # 护栏3：每日新开仓上限（防高频扫描放大开仓次数）
-CORR_MAX = 0.70                   # 与现有持仓的相关性上限：超过即视为"同一个押注"，不再开新仓
+# （旧的 CORR_MAX 已被 CORR_CLUSTER_MAX 取代，见上方常量）
 
 
 def corr_with_open(symbol: str, open_syms: list[str], bars: int = 90) -> tuple[float, str | None]:
@@ -193,6 +204,29 @@ def ledger_rows() -> list[dict]:
     if not os.path.exists(TRADES_LOG):
         return []
     return [json.loads(l) for l in open(TRADES_LOG, encoding="utf-8") if l.strip()]
+
+
+def portfolio_heat(positions: dict, equity: float) -> tuple[float, list]:
+    """组合热度 = 各持仓「当前真实风险额」合计占权益比。
+    单笔风险 = |当前价 − 保护止损价| × 持仓量；止损价取自交易所 algo 单（最权威）。"""
+    stops = {}
+    for o in bx.open_algo_orders():
+        if o.get("orderType") == "STOP_MARKET":
+            stops[o["symbol"]] = float(o.get("triggerPrice") or 0)
+    detail, total = [], 0.0
+    for sym, p in positions.items():
+        amt = abs(float(p.get("positionAmt", 0)))
+        stop = stops.get(sym)
+        try:
+            px = float(bx.mark_price(sym))
+        except Exception:                                      # noqa: BLE001
+            px = float(p.get("entryPrice") or 0)
+        risk = abs(px - stop) * amt if stop else abs(px - float(p.get("entryPrice") or px)) * amt
+        total += risk
+        detail.append({"symbol": sym, "risk_usd": round(risk, 4),
+                       "stop": stop, "price": round(px, 6), "amount": amt})
+    pct = (total / equity * 100) if equity else 0.0
+    return round(pct, 3), detail
 
 
 def cooldown_ok(symbol: str, rows: list[dict]) -> tuple[bool, str]:
@@ -388,6 +422,9 @@ def main() -> int:
     e_rows = ledger_rows()
     positions = open_positions()
     if positions:
+        _h, _hd = portfolio_heat(positions, wallet)
+        lines.append(f"> 组合热度：**{_h}%**（上限 {MAX_PORTFOLIO_HEAT_PCT}%）｜"
+                     + "；".join(f"{d['symbol']} 风险 ${d['risk_usd']}" for d in _hd))
         lines.append("> 现有持仓：" + "；".join(f"{s} {p['positionAmt']} @ {p['entryPrice']}" for s, p in positions.items()))
         lines.append("\n### 一、持仓管理（论点复核）")
         manage_positions(positions, live, a.profile, lines)
@@ -443,10 +480,16 @@ def main() -> int:
         if not db_ok:
             lines.append(f"\n**{sym}**：跳过 —— {db_why}")
             continue
+        # 建仓闸③b：组合热度上限（当前持仓风险合计 + 本笔 1% ≤ 上限）
+        heat_pct, heat_detail = portfolio_heat(positions, wallet) if positions else (0.0, [])
+        if heat_pct + 1.0 > MAX_PORTFOLIO_HEAT_PCT:
+            lines.append(f"\n**{sym}**：跳过 —— 组合热度 {heat_pct}% + 本笔 1% > 上限 "
+                         f"{MAX_PORTFOLIO_HEAT_PCT}%（当前持仓风险合计 ${sum(d['risk_usd'] for d in heat_detail):.3f}）")
+            continue
         # 建仓闸④：与现有持仓高度相关 = 同一个押注（防重复下注，如实盘中 MU/MUU 同源）
         c, cw = corr_with_open(sym, list(positions.keys()))
-        if cw and abs(c) > CORR_MAX:
-            lines.append(f"\n**{sym}**：跳过 —— 与现有持仓 {cw} 相关性 {c}（>{CORR_MAX}），同一押注不重复下注")
+        if cw and abs(c) > CORR_CLUSTER_MAX:
+            lines.append(f"\n**{sym}**：跳过 —— 与现有持仓 {cw} 相关性 {c}（>{CORR_CLUSTER_MAX}），视为同一簇押注")
             continue
         try:
             state = cd.build_state(sym, a.profile, wallet, None, a.leverage)
