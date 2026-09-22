@@ -548,15 +548,33 @@ def main() -> int:
         res = [float(x) for x in (state["structure_levels"]["resistance_4h"] or [])]
         atr = state["trend_relative_bps"]["atr_pct_4h"] or 0
         if gated["action"] in ("long", "short") and gated["size_multiplier"]:
-            if gated["action"] == "long":
-                stop = round(max([s for s in sups if s < price] or [price * (1 - atr * 3 / 100)]) * 0.997, 6)
-                tp = round(res[0], 6) if res else round(price * (1 + atr * 5 / 100), 6)
-            else:
-                stop = round(min([r for r in res if r > price] or [price * (1 + atr * 3 / 100)]) * 1.003, 6)
-                tp = round(sups[0], 6) if sups else round(price * (1 - atr * 5 / 100), 6)
-            risk = abs(price - stop)
-            rr = (abs(tp - price) / risk) if risk else None
+            # 结构性计划：优先用真实结构位，但止损距离夹在 [1xATR, 3xATR]，
+            # 止盈至少 2.5x 止损距离 —— 保证 RR>=2.5 由构造决定，而非碰运气。
+            # （旧兜底是 止损3xATR / 止盈5xATR → RR 恒为 1.67 < 2.5，
+            #   导致所有"上方无压力/下方无支撑"的区间极值标的永远造不出计划，实盘已发生）
+            atr_abs = price * atr / 100 if atr else 0
             rr_min = cd.PROFILES[a.profile].get("rr_min", 2.5)
+            if atr_abs > 0:
+                if gated["action"] == "long":
+                    below = [s for s in sups if s < price]
+                    sd = min(price - s for s in below) if below else atr_abs
+                    sd = min(max(sd, 1.0 * atr_abs), 3.0 * atr_abs)
+                    stop = round(price - sd, 6)
+                    above = [r for r in res if r > price]
+                    td = max((min(above) - price) if above else 0, rr_min * sd)
+                    tp = round(price + td, 6)
+                else:
+                    above_r = [r for r in res if r > price]
+                    sd = min(r - price for r in above_r) if above_r else atr_abs
+                    sd = min(max(sd, 1.0 * atr_abs), 3.0 * atr_abs)
+                    stop = round(price + sd, 6)
+                    below_s = [s for s in sups if s < price]
+                    td = max((price - max(below_s)) if below_s else 0, rr_min * sd)
+                    tp = round(price - td, 6)
+                risk = abs(price - stop)
+                rr = (abs(tp - price) / risk) if risk else None
+            else:
+                rr = None
             if rr and rr >= rr_min:
                 plan = {"entry": price, "stop": stop, "tp1": tp, "rr": round(rr, 2)}
             else:
