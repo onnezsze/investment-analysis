@@ -248,6 +248,32 @@ def portfolio_heat(positions: dict, equity: float) -> tuple[float, list]:
     return round(pct, 3), detail
 
 
+def equity_permission() -> dict:
+    """美股大盘许可：用 SPYUSDT（标普500 ETF 永续）日线判断大盘趋势。
+    依据（2026-09-22 影子账本 171 笔）：美股做空是唯一持续亏损的组合
+    （42 笔、平均 -0.524R、止损率 26%），而同期美股做多 8 笔 0 次止损、+0.252R。
+    个股跟随大盘，故做空美股需大盘本身处于弱势（收盘价在 EMA20 下方）。"""
+    try:
+        df = cd.cs.klines("binance", "SPYUSDT", "1d", 80, "futures")
+        cl = [float(x) for x in df["Close"].tolist()]
+        if len(cl) < 55:
+            return {"ok": False, "why": "SPY 日线不足"}
+        def ema(v, n):
+            a = 2 / (n + 1)
+            e = v[0]
+            for x in v[1:]:
+                e = x * a + e * (1 - a)
+            return e
+        last = cl[-1]
+        e20, e50 = ema(cl, 20), ema(cl, 50)
+        return {"ok": True, "last": round(last, 2), "ema20": round(e20, 2), "ema50": round(e50, 2),
+                "above_ema20": last > e20, "above_ema50": last > e50,
+                "r20_pct": round((last / cl[-21] - 1) * 100, 2) if len(cl) > 21 else None,
+                "short_allowed": last < e20}
+    except Exception as e:                                        # noqa: BLE001
+        return {"ok": False, "why": f"{type(e).__name__}: {e}"}
+
+
 def margin_ok(notional: float, leverage: int, available: float, buffer: float = 0.95) -> tuple[bool, str]:
     """保证金闸：所需保证金 = 名义/杠杆；留 5% 缓冲，超过可用余额则拒绝。
     并发上限提到 10 后，这才是真正会卡住开仓的约束（1% 风险 x 1% 止损 → 名义≈权益，5x 下每笔占约 20% 保证金）。"""
@@ -662,6 +688,18 @@ def main() -> int:
                 lines.append(f"　→ 仓位反推失败：{sz['reason']}，跳过")
                 record(TRADES_LOG, rec)
                 continue
+        # 建仓闸③d：美股大盘许可 —— 做空美股需 SPY 日线在 EMA20 下方
+        if klass == "tradfi" and gated["action"] == "short":
+            _eq = equity_permission()
+            if _eq.get("ok") and not _eq["short_allowed"]:
+                lines.append(f"　→ **美股做空无大盘许可**：SPY {_eq['last']} 在 EMA20 {_eq['ema20']} 上方"
+                             f"（EMA50 {_eq['ema50']}，20日 {_eq['r20_pct']:+.2f}%）→ 不开仓"
+                             f"（实测美股做空 42 笔均 -0.524R、止损率 26%）")
+                rec["equity_permission_blocked"] = _eq
+                record(TRADES_LOG, rec)
+                continue
+            if _eq.get("ok"):
+                lines.append(f"　→ 美股大盘许可：SPY {_eq['last']} < EMA20 {_eq['ema20']} ✅")
         # 建仓闸③c：逆势加价 —— 与 4H 趋势相反时要求更高置信度（不依赖模型自觉）
         _tr = state["trend_relative_bps"]
         _vs50 = (_tr.get("ema_position_pct") or {}).get("vs_ema50") or 0
