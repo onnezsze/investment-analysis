@@ -141,7 +141,7 @@ python3 ~/.hermes/skills/finance/investment-analysis/scripts/audit_memo.py \
 
 1. **取数（一条命令）**：
    ```bash
-   python3 ~/.hermes/skills/finance/investment-analysis/scripts/crypto_snapshot.py <SYMBOL>            --equity 10000 [--venue both|binance|htx] [--no-cg] [--no-dogdoing]
+   python3 ~/.hermes/skills/finance/investment-analysis/scripts/crypto_snapshot.py <SYMBOL>            --equity 10000 [--venue both|binance|htx] [--leverage 5] [--chain-id 56 --contract 0x...] [--no-dogdoing]
    ```
    例：`crypto_snapshot.py BTCUSDT --equity 10000` / `crypto_snapshot.py WIFUSDT --equity 5000`
    产出 `snapshot_<SYM>_<date>.json` + `dashboard_<SYM>_<date>.md`（默认 `~/crypto_snapshots/`）。
