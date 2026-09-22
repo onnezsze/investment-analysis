@@ -104,6 +104,31 @@ def _pct(a, b, nd=3):
 
 # ───────────────────────── 行情 / 指标 ─────────────────────────
 
+_CT_CACHE: dict[str, str] = {}
+
+
+def contract_type(symbol: str) -> str:
+    """查该 symbol 的 contractType（PERPETUAL / TRADIFI_PERPETUAL / ...），带缓存"""
+    if symbol in _CT_CACHE:
+        return _CT_CACHE[symbol]
+    ct = "UNKNOWN"
+    try:
+        info = get(f"{BIN_FUT}/fapi/v1/exchangeInfo")
+        for s in (info.get("symbols") or []):
+            if s.get("symbol") == symbol:
+                ct = s.get("contractType") or "UNKNOWN"
+                break
+    except Exception:                                          # noqa: BLE001
+        pass
+    _CT_CACHE[symbol] = ct
+    return ct
+
+
+def is_tradfi_contract(symbol: str) -> bool:
+    """Binance 的 TRADIFI_PERPETUAL = 股票/ETF/商品/外汇/Pre-IPO 永续"""
+    return contract_type(symbol) == "TRADIFI_PERPETUAL"
+
+
 def klines(exchange: str, symbol: str, interval: str, limit: int = 1000, market: str = "spot") -> pd.DataFrame:
     """分页取 K 线（Binance 单次上限 1000 根）"""
     rows, end = [], None
@@ -987,22 +1012,26 @@ def build(symbol: str, venue: str, equity: float, risk: float, use_dd: bool = Tr
 
     # 相对强弱 vs BTC
     rs = {}
+    tradfi = is_tradfi_contract(symbol)
+    bench_sym, bench_tag = ("SPYUSDT", "vs_spy") if tradfi else ("BTCUSDT", "vs_btc")
     if base.upper() == "BTC":
         rs["_note"] = "标的即为 BTC，不做相对 BTC 强弱与相关性计算"
+    if tradfi:
+        rs["_note_tradfi"] = "tradfi 标的与加密货币无共同驱动，基准改用 SPYUSDT（标普500ETF）"
     try:
-        btc = klines("binance", "BTCUSDT", "1d", 220, "spot")
+        btc = klines("binance", bench_sym, "1d", 220, "futures" if tradfi else "spot")
         if base.upper() != "BTC" and len(btc) > 120 and len(d1) > 120:
             for w, n in (("7d", 7), ("30d", 30), ("90d", 90)):
                 s_ = _pct(d1["Close"].iloc[-1], d1["Close"].iloc[-1 - n])
                 b_ = _pct(btc["Close"].iloc[-1], btc["Close"].iloc[-1 - n])
-                rs.setdefault("vs_btc", {})[w] = {"asset_pct": s_, "btc_pct": b_,
+                rs.setdefault(bench_tag, {})[w] = {"asset_pct": s_, "benchmark": bench_sym, "btc_pct": b_,
                                                   "excess_pct": _f((s_ or 0) - (b_ or 0), 2) if s_ is not None and b_ is not None else None}
             j = pd.concat([d1["Close"].pct_change().rename("a"), btc["Close"].pct_change().rename("b")], axis=1).dropna().tail(90)
             if len(j) > 20:
-                rs["corr_beta_btc_90d"] = {"corr": _f(j["a"].corr(j["b"]), 3),
+                rs[f"corr_beta{'_spy' if tradfi else '_btc'}_90d"] = {"benchmark": bench_sym, "corr": _f(j["a"].corr(j["b"]), 3),
                                            "beta": _f(j["a"].cov(j["b"]) / j["b"].var(), 3) if j["b"].var() else None}
     except Exception:                                      # noqa: BLE001
-        gaps.append("BTC 相对强弱计算失败")
+        gaps.append(f"{bench_sym} 相对强弱计算失败")
 
     # 场所流动性
     liq = {}
@@ -1028,7 +1057,8 @@ def build(symbol: str, venue: str, equity: float, risk: float, use_dd: bool = Tr
     d = {
         "meta": {"symbol": symbol, "base": base, "venues": (["Binance"] if venue == "binance" else
                                                             ["HTX"] if venue == "htx" else ["Binance", "HTX"]),
-                 "asset_class": "加密货币（现货 + USDT本位永续）",
+                 "asset_class": "tradfi 永续（股票/ETF/商品/外汇）" if is_tradfi_contract(symbol) else "加密货币（现货 + USDT本位永续）",
+                 "contract_type": contract_type(symbol),
                  "as_of": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
                  "last_bar_4h_utc": str(spot_4h.index[-1])[:19] if len(spot_4h) else None,
                  "trading_hours": "7x24 连续，无收盘与隔夜缺口",

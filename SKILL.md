@@ -137,6 +137,16 @@ python3 ~/.hermes/skills/finance/investment-analysis/scripts/audit_memo.py \
 | 链上必要性 | Noul 0.68 | 输出解锁悬顶/市值占FDV/稳定币净发行；非主流币不可核验时降级为"仅技术面有效" |
 | 最值得保留 | Choice 0.73 | **数字审计质量门原样保留** |
 
+**标的发现（先做这一步）**：`scripts/crypto_scan.py` 从 dogdoing 挖机会并校验可交易性：
+```bash
+python3 .../crypto_scan.py --top 24                # 加密 + tradfi 混合榜
+python3 .../crypto_scan.py --only tradfi           # 只看股票/ETF/商品/外汇
+```
+- 候选来源：`square-hype`(社交热度) / `oi-divergence`(持仓异动) / `gainers` / `losers` / `hotspots`(Alpha) / `us-stocks`(tradfi 叙事)
+- 可交易性校验：Binance `PERPETUAL`(加密) 与 `TRADIFI_PERPETUAL`(股票/ETF/商品) + HTX 永续；自动处理 1000/1000000 乘数
+- 机会分口径**按资产类别分开**：加密=热度+OI背离+摆幅+费率偏离+流动性；**tradfi=流动性+摆幅+新闻流+费率偏离**（tradfi 无社交热度与 OI 背离）
+- 输出 `~/crypto_snapshots/watchlist_<date>.json`，供 `autotrade.py --scan` 直接消费
+
 **步骤**：
 
 1. **取数（一条命令）**：
@@ -177,14 +187,23 @@ python3 ~/.hermes/skills/finance/investment-analysis/scripts/audit_memo.py \
 
 6. **交付**：`~/crypto_snapshots/memo_<SYM>_<date>.md` + 仪表盘 + 缺口清单。
 
+7. **执行层（真实下单，默认 dry-run）**：
+   ```bash
+   python3 .../binance_exec.py account|specs BTCUSDT|order SYM buy --notional 40 --sl .. --tp .. [--live]
+   python3 .../autotrade.py --scan 8 --include-tradfi [--dry]     # 定时巡检编排（主开关控制是否真下单）
+   ```
+   - `binance_exec.py`：**默认只预览，必须显式 `--live` 才发送**；自动按 stepSize/tickSize 取整、校验 MIN_NOTIONAL 与可用保证金；止损止盈用 `reduceOnly` 条件单
+   - `autotrade.py`：主开关文件 `~/.binance_futures_autotrade.on` 存在才真下单（**删掉即停**）；硬安全阀=单标的一笔、权益地板（默认 85 USDT）、只做扫描榜内标的、每笔风险 1%
+   - ⚠️ **验收纪律**：`crypto_decide.py`、`crypto_scan.py`、`equity_snapshot.py` 我改完必须跑一次真数据自测；`binance_exec.py` 改完必须跑 `order ... `（不带 --live）确认取整与最小名义校验生效
+
 ### 数据源分工（重要）
 
 **数据源只有两类（用户指定，不得引入第三类）**：交易所公开 API + dogdoing.ai。缺数据就写"未取到/未核验"，**不要为了补字段去接其他来源**。
 
 | 来源 | 覆盖 | 说明 |
 |---|---|---|
-| Binance 公开 API | 行情/K线/资金费率+历史/OI+历史/多空账户比/大户持仓比/主动买卖比/订单簿深度 | 价格的**唯一权威源** |
-| HTX 公开 API | 资金费率+历史/OI/深度/行情 | 用户所在场所；跨场所资金费率差为独立信号（脚本已标注"历史均值口径"） |
+| Binance 公开 API（加密 + tradfi） | 行情/K线/资金费率+历史/OI+历史/多空账户比/大户持仓比/主动买卖比/订单簿深度 | 价格的**唯一权威源**。**同时覆盖 tradfi**：`contractType=TRADIFI_PERPETUAL` 共 **199 个**（EQUITY 163 / HK_EQUITY 15 / KR_EQUITY 8 / COMMODITY 8 / FX 1 / PREMARKET 2），如 `XAUUSDT`(黄金)、`TQQQUSDT`/`QQQUSDT`/`SPYUSDT`/`SOXLUSDT`(ETF)、`NVDAUSDT`/`TSLAUSDT`/`MSTRUSDT`(股票)、`CLUSDT`(原油) |
+| HTX 公开 API | 资金费率+历史/OI/深度/行情 | 用户所在场所；跨场所资金费率差为独立信号（脚本已标注"历史均值口径"）。HTX 亦有 tradfi 合约（部分与 Binance 重叠），本工作流默认优先 Binance 执行 |
 | **dogdoing.ai** 公开 JSON 接口 | 社交热度、AI 情绪与摘要、OI 背离、链上代币信息、合约审计、KOL 观点、预测市场、Alpha 热点、涨跌幅榜、资讯、恐惧贪婪 | `square-hype` `sentiment` `oi-divergence` `token-info` `token-audit` `serenity-tweets` `prediction-markets` `hotspots` `gainers` `losers` `news` `fear-greed` `market-tickers` `klines`；**其价格仅作交叉校验，不作权威价** |
 | 交易所 API（后续执行） | 下单/持仓/保证金 | 用户已明确后续执行走交易所 API |
 | **TypeSafe（jev-latest）** | 单次决策的语义判断（方向/拥挤度/可执行性/失效清晰度） | 决策层用；`TYPESAFE_API_KEY` 已在环境中；与数据源无关，不引入行情数据 |

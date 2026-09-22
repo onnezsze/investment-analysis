@@ -37,6 +37,28 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import crypto_snapshot as cs  # noqa: E402  复用事实层
+try:                                                              # 交易所规格（存在凭证时）
+    import binance_exec as bx                                      # noqa: E402
+except Exception:                                                 # noqa: BLE001
+    bx = None
+
+
+def venue_constraints(symbol: str) -> dict:
+    """该合约的真实可执行约束：最小名义/步长/一档最大杠杆/维持保证金率（账户层）"""
+    if bx is None:
+        return {}
+    try:
+        sp = bx.spec(symbol)
+        acct = bx.account_state()
+        return {
+            "min_notional_usdt": sp["min_notional"], "step_size": sp["step_size"],
+            "tick_size": sp["tick_size"], "venue_max_leverage_x": sp["max_leverage"],
+            "maint_margin_ratio": sp["maint_margin_ratio"],
+            "account_available_usdt": float(acct.get("availableBalance") or 0),
+            "account_wallet_usdt": float(acct.get("totalWalletBalance") or 0),
+        }
+    except Exception as e:                                        # noqa: BLE001
+        return {"_error": f"{type(e).__name__}: {e}"[:80]}
 
 LEDGER = os.path.join(os.path.expanduser("~"), "crypto_snapshots", "decisions.jsonl")
 QUESTIONS_VERSION = "monad-style-v1"
@@ -170,10 +192,20 @@ def build_state(symbol: str, profile: str, equity: float, horizon_hours: float |
     px = snap["price"]["spot_price"]
     perp = snap["meta"]["perp_symbol"]
     h4 = snap["technicals"]["h4"]
-    bars4 = cs.klines("binance", perp if snap["meta"]["perp_symbol"] == symbol else symbol,
-                      "4h", 400, "futures") if False else cs.klines("binance", symbol, "4h", 400, cs.BIN_SPOT and "spot")
+    def _k(interval: str, n: int):
+        """tradfi（股票/ETF/商品）无现货K线，自动回退到永续"""
+        for mk in ("spot", "futures"):
+            try:
+                d = cs.klines("binance", symbol, interval, n, mk)
+                if len(d):
+                    return d
+            except Exception:                                  # noqa: BLE001
+                continue
+        return cs.pd.DataFrame()
+
+    bars4 = _k("4h", 400)
     closes4 = [float(x) for x in bars4["Close"].tolist()] if len(bars4) else []
-    h1 = cs.klines("binance", symbol, "1h", 400, "spot")
+    h1 = _k("1h", 400)
     closes1 = [float(x) for x in h1["Close"].tolist()] if len(h1) else []
     fund = snap["funding"].get("binance", {})
     hz = horizon_hours or PROFILES[profile]["horizon_hours"]
@@ -249,6 +281,7 @@ def build_state(symbol: str, profile: str, equity: float, horizon_hours: float |
         },
         "cost": cost,
         "execution_constraints": {
+            "venue": venue_constraints(snap["meta"]["perp_symbol"]),
             "account_equity_usd": equity,
             "planned_notional_usd": planned_notional,
             "exchange_leverage_setting": leverage,
@@ -402,6 +435,7 @@ def mock_request(state: dict, profile: str) -> dict:
 # ───────────────────────── 代码侧：归一化 + 门控 + 仓位（代码拥有执行） ─────────────────────────
 
 def gate_and_size(state: dict, answers: dict, profile: str) -> dict:
+    symbol_upper = state.get("symbol", "")
     """composite scoring + confidence-gated routing + 波动率目标仓位 + 爆仓距离校验"""
     prof = PROFILES[profile]
     w = prof["weights"]
@@ -461,10 +495,21 @@ def gate_and_size(state: dict, answers: dict, profile: str) -> dict:
         lev = state["execution_constraints"]["exchange_leverage_setting"]
         liq_dist = (1 / lev) - 0.005 - 0.001 if lev > 1 else None
         liq_ok = liq_dist is not None and liq_dist >= 1.5 * stop_pct
-        if not liq_ok:
+        vc = state["execution_constraints"].get("venue") or {}
+        min_notional = vc.get("min_notional_usdt")
+        if min_notional and notional and notional < min_notional:
+            gates.append(f"**仓位低于交易所最小名义**：按 1% 风险纪律算出的名义 ${notional:,} < {symbol_upper} 最小名义 "
+                         f"${min_notional} → 该合约在 {equity:.0f} USDT 账户上无法执行此纪律")
+            verdict, size_mult, notional = (f"观望（{symbol_upper} 最小名义 ${min_notional} > 纪律仓位 ${notional:,}；"
+                                            f"需提高风险预算或换更小名义的合约）"), 0.0, None
+            liq_ok = False
+        if vc.get("venue_max_leverage_x") and lev > vc["venue_max_leverage_x"]:
+            gates.append(f"交易所杠杆 {lev}x 超过该合约一档上限 {vc['venue_max_leverage_x']}x → 降至上限")
+            lev = float(vc["venue_max_leverage_x"])
+        if not liq_ok and notional:
             gates.append(f"爆仓距离校验未过（{liq_dist and round(liq_dist*100,2)}% < 1.5×止损 {round(stop_pct*100*1.5,2)}%）→ 需降低杠杆")
             verdict, size_mult, notional = "观望（杠杆过高，强平先于止损）", 0.0, None
-        else:
+        elif notional:
             sizing = {"risk_budget_pct": round(1.0 * size_mult, 2), "stop_atr_mult": 2.0,
                       "stop_distance_pct": round(stop_pct * 100, 2), "notional_usd": notional,
                       "implied_leverage_x": round(notional / equity, 3) if notional else None,
@@ -473,7 +518,8 @@ def gate_and_size(state: dict, answers: dict, profile: str) -> dict:
                       "est_liquidation_price": round(state["market_structure"]["price"] * (1 - liq_dist), 2) if liq_dist else None,
                       "liq_distance_pct": round(liq_dist * 100, 2) if liq_dist else None,
                       "liq_check": "通过（强平距离 ≥ 1.5×止损距离）",
-                      "funding_carry_bps_over_horizon": state["cost"]["funding_carry_bps"]}
+                      "funding_carry_bps_over_horizon": state["cost"]["funding_carry_bps"],
+                      "venue_min_notional_usdt": (state["execution_constraints"].get("venue") or {}).get("min_notional_usdt")}
     return {"action": action, "probabilities": probs, "confidence": conf,
             "conviction": round(conviction, 3) if conviction is not None else None,
             "conviction_parts": {k: (round(v, 3) if v is not None else None) for k, _, v in parts},

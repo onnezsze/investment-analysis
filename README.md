@@ -31,6 +31,13 @@
   - **dogdoing.ai** 公开 JSON 接口：社交热度榜、AI 情绪与摘要、OI 背离、链上代币信息（市值/FDV/持有人/Top10 集中度/流动性）、合约审计、KOL 观点、预测市场、Alpha 热点、涨跌幅榜、资讯、恐惧贪婪指数
   - 输出**波动率目标仓位表**（名义头寸/隐含杠杆/交易所杠杆/保证金/估强平价/爆仓距离校验），并区分「隐含杠杆」与「交易所杠杆」
 - 已移除 CoinGecko 与 alternative.me；**无全网市值/BTC 占比/稳定币数据源**，报告中不得出现此类结论
+### C. 标的发现与 tradfi（Traditionally Finance）
+
+- **标的发现** `scripts/crypto_scan.py`：从 dogdoing 挖机会（社交热度 / OI 背离 / 涨跌幅榜 / Alpha 热点 / 美股叙事），交叉校验 Binance 与 HTX 的可交易性，按资产类别分别打分，输出可交易榜单。
+- **tradfi 覆盖**：Binance `contractType=TRADIFI_PERPETUAL` 共 **199 个** —— 股票（AAPL/NVDA/TSLA/AMD/MU/MSTR…163 个）、港股 15、韩股 8、商品（XAU 黄金/XAG 白银/CL 原油）8、外汇 1、Pre-IPO 2（含 Anthropic）；ETF 如 TQQQ/QQQ/SPY/SOXL/DRAM/EWT/IWM/URNM。**用同一套 Binance 凭证即可交易**，且 **24/7 无休市**（实测 1H K线零缺口）。
+- **tradfi 口径差异**：基准指数从 BTC 改为 SPYUSDT；无现货K线（走永续）；资金费率常显著非零（实测 AMD 年化 85.8%）。
+- **执行层** `scripts/binance_exec.py`（默认 dry-run，`--live` 才发单）+ `scripts/autotrade.py`（4 小时巡检；主开关文件 `~/.binance_futures_autotrade.on` 存在才真下单，删掉即停）。
+
 - **决策层** `scripts/crypto_decide.py`：借鉴 [jarrodwatts/jev-trader](https://github.com/jarrodwatts/jev-trader) 的 TypeSafe 范式 —— 代码构建相对化状态 → 一次请求并行四问 → **置信度门控** → 代码侧硬约束（成本/RR≥2/爆仓距离）→ 写入 `decisions.jsonl` 账本；`--resolve` 回填结果并按「动作 × 置信度桶」统计命中率。详见 `references/jev-patterns.md`
 - **研究版**（`references/crypto-research.md`）：长期代币研究框架（Tokenomics / NVT / TVL / 活跃地址 / 解锁日历），链上数据多需付费接口，取不到必须标注"未核验"。
 
@@ -46,8 +53,11 @@ investment-analysis/
 ├── README.md                      # 本说明
 ├── scripts/
 │   ├── equity_snapshot.py         # 股票数据引擎（yfinance）
-│   ├── crypto_snapshot.py         # 加密数据引擎（交易所API + 聚合层）
+│   ├── crypto_scan.py             # 标的发现器（dogdoing 挖机会 → 可交易榜单，含 tradfi）
+│   ├── crypto_snapshot.py         # 数据引擎（加密 + tradfi 永续，含资金费率/OI/深度/滑点）
 │   ├── crypto_decide.py           # 单次决策引擎（TypeSafe 单点决策 + 置信度门控 + 账本）
+│   ├── binance_exec.py            # 执行层（USDT-M 下单，默认 dry-run，需 --live）
+│   ├── autotrade.py               # 定时巡检编排（扫描→决策→门控→执行→记账，含硬安全阀）
 │   └── audit_memo.py              # 数字审计质量门
 ├── references/
 │   ├── fundamentals.md            # 股票基本面模板
