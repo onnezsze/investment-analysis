@@ -530,6 +530,7 @@ def main() -> int:
         state_hash = hashlib.sha256(
             json.dumps(state, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()[:16]
         rec = {
+            "state_file": cd.persist_state(state, state_hash),
             "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"), "symbol": sym,
             "perp_contract": state["perp_contract"], "venue": venue, "asset_class": klass,
             "scan_score": item.get("score"), "model": answers.get("model"),

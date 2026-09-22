@@ -775,6 +775,47 @@ def dogdoing_block(base: str, chain_id: int | None = None, contract: str | None 
         out["price_cross_check"] = {"dogdoing_price": _f(mine_t[0].get("price"), 6),
                                     "dogdoing_change_24h_pct": _f(mine_t[0].get("change"), 2),
                                     "_purpose": "与交易所 API 现价交叉校验，偏差过大说明数据陈旧"}
+    # ⑫ 数据校验层：显式记录每个榜单"取到/为空/失败"，禁止静默消失
+    expect = {
+        "square_hype": "币安广场社交热度榜",
+        "square_hype_top5": "广场热度 Top5",
+        "oi_divergence": "持仓量 vs 价格背离",
+        "oi_divergence_market_top": "OI 背离全市场榜",
+        "market_breadth": "涨跌幅榜（市场广度）",
+        "fear_greed": "恐惧贪婪指数",
+        "sentiment": "社交热度 · AI 情绪",
+        "news": "资讯",
+        "market_tickers": "主流价格交叉校验",
+        "token_profile": "链上代币信息（市值/FDV/持有人/前10持仓）",
+        "token_audit": "代币合约审计",
+        "kol_views": "KOL/分析师观点",
+        "event_markets": "预测市场隐含概率",
+        "alpha_hotspots": "Alpha/Meme 热点与资金净流入",
+        "price_cross_check": "价格交叉校验结果",
+    }
+    # 覆盖范围有限的榜单：为空时属"该标的不在覆盖内"，不等于取数失败（避免报假警）
+    coverage = {"market_tickers": "该榜仅覆盖 10 个主流币，本标的不在其中",
+                "price_cross_check": "同上（仅主流币可交叉校验）",
+                "token_profile": "链上代币信息需要能解析出合约地址；tradfi 与主流币无对应 on-chain 页面",
+                "token_audit": "同上（仅链上代币可审计）"}
+    ok, empty, na = [], [], []
+    for k, label in expect.items():
+        v = out.get(k)
+        filled = bool(v) and not (isinstance(v, dict) and v.get("status") in ("未取到", "失败"))
+        if filled:
+            ok.append(f"{k}({label})")
+        elif k in coverage:
+            na.append({"key": k, "label": label, "reason": coverage[k]})
+        else:
+            empty.append(f"{k}({label})")
+    out["_validation"] = {
+        "checked_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "ok_count": len(ok), "empty_count": len(empty), "not_covered_count": len(na),
+        "ok": ok,
+        "empty": empty,
+        "not_covered": na,
+        "_note": "empty=本次取数失败（报告须显式标注）；not_covered=该标的不在这类榜单覆盖范围内（非失败，不必告警）",
+    }
     return out
 
 
@@ -942,6 +983,11 @@ def render_dashboard(d: dict) -> str:
         L.append(f"| 聚合源价格交叉校验 | 偏差 {cc.get('deviation_vs_exchange_pct')}%（{cc.get('verdict')}） |")
     nw = ag.get("news") or {}
     if nw.get("items"):
+        _v = (d.get("aggregator") or {}).get("_validation") or {}
+        if _v:
+            L.append(f"| 聚合层数据校验 | ✅ {_v.get('ok_count', 0)} 项取到 ｜ ⚠️ 取数失败 {_v.get('empty_count', 0)} ｜ "
+                     f"➖ 不覆盖 {_v.get('not_covered_count', 0)}"
+                     + (f"｜失败项：{', '.join(_v.get('empty', []))}" if _v.get("empty") else "") + " |")
         L.append(f"| 相关资讯 | {len(nw['items'])} 条（{nw.get('scope')}） |")
     rk = d.get("risk_framework", {})
     if rk.get("table"):

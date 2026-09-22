@@ -61,6 +61,21 @@ def venue_constraints(symbol: str) -> dict:
         return {"_error": f"{type(e).__name__}: {e}"[:80]}
 
 LEDGER = os.path.join(os.path.expanduser("~"), "crypto_snapshots", "decisions.jsonl")
+STATE_DIR = os.path.join(os.path.expanduser("~"), "crypto_snapshots", "states")
+
+
+def persist_state(state: dict, state_hash: str) -> str:
+    """把决策时喂给模型的完整状态落盘（按 state_hash 命名，同一状态只写一次）。
+    账本里记的是 state_hash，任何一次决策都能用这里的文件完整复现。"""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        p = os.path.join(STATE_DIR, f"{state_hash}.json")
+        if not os.path.exists(p):
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=1, default=str)
+        return p
+    except Exception as e:                                        # noqa: BLE001
+        return f"<落盘失败 {type(e).__name__}: {e}>"
 QUESTIONS_VERSION = "monad-style-v1"
 
 
@@ -280,6 +295,47 @@ def build_state(symbol: str, profile: str, equity: float, horizon_hours: float |
             "ai_sentiment": sm.get("sentiment"),
             "ai_sentiment_summary": (sm.get("summary") or "")[:240],
         },
+        # ── 以下为 dogdoing 榜单中此前"取了但没进决策"的部分（2026-09-22 补入）──
+        "token_concentration": {
+            "top10_holders_pct": tp.get("top10HoldersPercent"),
+            "holders": tp.get("holders"),
+            "liquidity_usd": tp.get("liquidity"),
+            "market_cap_usd": tp.get("marketCap"),
+            "scope_warning": tp.get("scope_warning"),
+            "_use": "前10持仓占比过高（>30%）→ 项目方/做市商控盘，抛压与插针风险大，仓位应下调",
+        } if (tp := (agg.get("token_profile") or {})) else None,
+        "alpha_narratives": {
+            "chain": (agg.get("alpha_hotspots") or {}).get("chain"),
+            "topics": [{"topic": t.get("topic"), "type": t.get("type"),
+                        "net_inflow_usd": t.get("net_inflow"),
+                        "tokens": [x.get("symbol") for x in (t.get("tokens") or [])][:4],
+                        "source_link": t.get("topic_link")}
+                       for t in ((agg.get("alpha_hotspots") or {}).get("topics") or [])[:3]],
+            "_use": "Alpha 热点/叙事与资金净流入：判断标的是否在当下叙事主线上（不在则无题材驱动）",
+        },
+        "kol_views": {
+            "scope": (agg.get("kol_views") or {}).get("scope"),
+            "top": [{"text": (t.get("textCN") or t.get("text") or "")[:160],
+                     "tickers": t.get("tickers"), "views": t.get("viewCount")}
+                    for t in ((agg.get("kol_views") or {}).get("tweets") or [])[:2]],
+            "_use": "KOL 观点：只作叙事参考，不构成信号；若未提及标的，须在报告中说明",
+        },
+        "event_markets": {
+            "top": [{"question": m.get("question"), "volume_usd": m.get("volume_usd"),
+                     "distribution_valid": m.get("distribution_valid"),
+                     "outcomes": (m.get("outcomes") or [])[:3]}
+                    for m in ((agg.get("event_markets") or {}).get("markets") or [])[:2]],
+            "_use": (agg.get("event_markets") or {}).get("_use"),
+        },
+        "market_breadth": {
+            "top_gainers": [{"symbol": g.get("symbol"), "change_pct": g.get("change_pct")}
+                            for g in ((agg.get("market_breadth") or {}).get("top_gainers") or [])[:3]],
+            "top_losers": [{"symbol": l.get("symbol"), "change_pct": l.get("change_pct")}
+                           for l in ((agg.get("market_breadth") or {}).get("top_losers") or [])[:3]],
+            "_use": (agg.get("market_breadth") or {}).get("_use"),
+        },
+        "news_headlines": [{"title": n.get("title"), "source": n.get("source"), "published_at": n.get("publishedAt")}
+                           for n in ((agg.get("news") or {}).get("items") or [])[:3]],
         "structure_levels": {
             "support_4h": snap["technicals"]["levels_4h"].get("support_zones"),
             "resistance_4h": snap["technicals"]["levels_4h"].get("resistance_zones"),
@@ -302,6 +358,8 @@ def build_state(symbol: str, profile: str, equity: float, horizon_hours: float |
                     f"以及应选 long / short / no_trade",
             "timing": "决策后以限价或市价在数分钟内建仓，止损与止盈按结构位设置",
             "inputs_priority": "最重要的是 taker_flow（CVD 与近期主动成交）与 positioning（资金费率/OI 拥挤度）；"
+                               "其次是 token_concentration（前10持仓集中度）、alpha_narratives（是否在叙事主线）、"
+                               "market_breadth（资金主线是否在本标的上）、sentiment、news_headlines、kol_views、event_markets；"
                                "其次 market_structure 的盘口失衡与深度；cost.total_cost_bps 是必须跨过的门槛；"
                                "structure_levels 决定止损位置，execution_constraints 决定杠杆与仓位上限",
         },
@@ -695,6 +753,7 @@ def main() -> int:
         "sizing": gated["sizing"], "cost_bps": gated["cost_bps"], "expected_move_bps": gated["expected_move_bps"],
         "plan": plan, "price_at_decision": price, "outcome": None,
     }
+    rec["state_file"] = persist_state(state, state_hash)
     if not a.dry_run:
         append_ledger(a.ledger, rec)
 
