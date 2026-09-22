@@ -650,7 +650,7 @@ def main() -> int:
                 record(TRADES_LOG, rec)
                 continue
         # 建仓闸④：保证金闸（拿到真实名义后校验；10 仓位下这才是真约束）
-        _mg_ok, _mg_why = margin_ok(sz["notional_usd"], a.leverage, available)
+        _mg_ok, _mg_why = margin_ok(sz["notional_usd"], a.leverage, equity)
         if not _mg_ok:
             lines.append(f"　→ 跳过 —— {_mg_why}")
             rec["margin_blocked"] = _mg_why
