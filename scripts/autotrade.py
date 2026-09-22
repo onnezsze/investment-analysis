@@ -574,9 +574,27 @@ def main() -> int:
         sz = size_from_plan(wallet, 0.01 * gated["size_multiplier"] * sg_mult, price, plan["stop"],
                             a.leverage, venue_min)
         if not sz["ok"]:
-            lines.append(f"　→ 仓位反推失败：{sz['reason']}，跳过")
-            record(TRADES_LOG, rec)
-            continue
+            # 最小名义地板：半仓算出的名义若低于交易所门槛，但「按最小名义开仓」的实际风险
+            # 仍在 1% 风险上限内 → 允许上浮到最小名义执行（否则高波动标的永远无法交易）
+            if venue_min and sz.get("stop_distance_pct"):
+                risk_floor = venue_min * sz["stop_distance_pct"] / 100
+                cap = wallet * 0.01 * gated["size_multiplier"] * 2      # 上限：不超过该档位的 2 倍（即 ≤1%）
+                cap = min(cap, wallet * 0.01)                          # 且绝不突破 1% 绝对上限
+                if risk_floor <= cap:
+                    lines.append(f"　→ 半仓名义 ${sz['notional_usd']} 低于最小名义 ${venue_min}；"
+                                 f"按最小名义 ${venue_min} 上浮执行（实际风险 ${risk_floor:.3f} = "
+                                 f"权益 {risk_floor / wallet * 100:.2f}%，仍在 1% 上限内）")
+                    sz = {"ok": True, "stop_distance_pct": sz["stop_distance_pct"],
+                          "notional_usd": venue_min, "risk_usd": round(risk_floor, 4),
+                          "margin_usd": round(venue_min / a.leverage, 2),
+                          "floored_by_min_notional": True}
+                else:
+                    lines.append(f"　→ 仓位反推失败：按最小名义 ${venue_min} 开仓的风险 ${risk_floor:.3f}"
+                                 f"（{risk_floor / wallet * 100:.2f}%）已超 1% 上限，跳过")
+            if not sz["ok"]:
+                lines.append(f"　→ 仓位反推失败：{sz['reason']}，跳过")
+                record(TRADES_LOG, rec)
+                continue
         stop_dist_pct, notional, risk_budget = sz["stop_distance_pct"], sz["notional_usd"], sz["risk_usd"]
         if sz.get("capped_by_leverage"):
             lines.append(f"　→ 名义受杠杆上限约束，压至 ${notional:,.2f}")
@@ -585,6 +603,7 @@ def main() -> int:
         rec["planned_side"] = side
         rec["actual_stop_distance_pct"] = round(stop_dist_pct, 3)
         rec["risk_usd"] = round(risk_budget, 4)
+        rec["floored_by_min_notional"] = bool(sz.get("floored_by_min_notional"))
         rec["sizing_basis"] = "按实际挂单止损反推（非 2×ATR 估算）"
         lines.append(f"　→ 仓位：名义 ${notional:,.2f}（按实际止损 {stop_dist_pct:.2f}% 反推，"
                      f"风险 ${risk_budget:.4f}；档位系数 {gated['size_multiplier']}"
