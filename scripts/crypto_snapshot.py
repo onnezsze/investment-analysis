@@ -16,13 +16,15 @@ crypto_snapshot.py — 加密货币交易工作流的数据引擎（美股引擎
 数据源（全部公开无需密钥）：
   · Binance 现货 + USDT 本位永续（行情/资金费率/OI/多空比/主动买卖/深度）
   · HTX 合约（资金费率/OI/深度/行情）—— 用户所在交易所，做跨场所对照
-  · CoinGecko（市值/FDV/流通量/历史高低/全市场与稳定币）
-  · alternative.me 恐惧贪婪指数
+  · dogdoing.ai 聚合层（唯一聚合数据源）：社交热度、AI 情绪与摘要、OI 背离、
+    代币信息（市值/FDV/持有人/top10 集中度/流动性）、合约审计、KOL 观点、
+    预测市场隐含概率、Alpha 热点、资讯、恐惧贪婪指数
 
 用法:
   python3 crypto_snapshot.py BTCUSDT
   python3 crypto_snapshot.py SOLUSDT --venue both --equity 10000 --risk 1.0
-  python3 crypto_snapshot.py HYPEUSDT --venue binance --no-cg     # 跳过 CoinGecko
+  python3 crypto_snapshot.py PEPEUSDT --chain-id 56 --contract 0x25d8...  # 指定链上合约取代币信息+审计
+  python3 crypto_snapshot.py HYPEUSDT --venue binance --no-dogdoing  # 只取交易所数据
   python3 crypto_snapshot.py BTCUSDT --out ~/crypto_snapshots
 
 输出: snapshot_<SYM>_<YYYYMMDD>.json + dashboard_<SYM>_<YYYYMMDD>.md
@@ -469,9 +471,10 @@ def positioning_block(symbol: str) -> dict:
     return out
 
 
-# ───────────────────────── dogdoing.ai（社交热度 / OI背离 / 链上安全） ─────────────────────────
+# ─────────────────── dogdoing.ai（唯一聚合数据源：情绪/热度/OI背离/代币信息/安全/资讯） ───────────────────
 
 DD = "https://dogdoing.ai"
+DD_CHAINS = {56: "BSC", 8453: "Base", 1: "Ethereum"}
 CN_NAMES = {"BTC": ("比特币",), "ETH": ("以太坊",), "SOL": ("Solana", "索拉纳"),
             "BNB": ("币安币",), "XRP": ("瑞波",), "DOGE": ("狗狗币",), "ADA": ("艾达",)}
 
@@ -482,10 +485,164 @@ def _sym_match(item_symbol: str, base: str) -> bool:
     return s == b or s.endswith(b) or s.lstrip("1000").lstrip("1000000") == b or b.endswith(s)
 
 
-def dogdoing_block(base: str, news_limit: int = 5) -> dict:
-    """dogdoing.ai 聚合层：社交热度、OI 背离、情绪、资讯（全部为其公开 JSON 接口）"""
+def dd_sentiment(base: str) -> dict:
+    """各链代币 AI 情绪 + 社交热度值 + 情绪摘要（dogdoing /api/sentiment）"""
+    out: dict = {"scanned_chains": {}}
+    for cid, cname in DD_CHAINS.items():
+        d = soft(lambda c=cid: get(f"{DD}/api/sentiment?chainId={c}"))
+        rows = (d or {}).get("data") or []
+        out["scanned_chains"][cname] = len(rows)
+        for r in rows:
+            if _sym_match(r.get("symbol"), base):
+                out["matched"] = {
+                    "symbol": r.get("symbol"), "chain": cname, "chain_id": cid,
+                    "contract_address": r.get("contractAddress"),
+                    "sentiment": r.get("sentiment"),
+                    "social_hype_value": _f(r.get("socialHype"), 0),
+                    "price_change_pct": _f(r.get("priceChange"), 2),
+                    "market_cap_chain_token_usd": _f(r.get("marketCap"), 0),
+                    "summary": (r.get("summary") or "")[:400],
+                    "detail": (r.get("detail") or "")[:800],
+                    "_warning": "market_cap_chain_token_usd 是**该链上封装代币**的市值（如 BSC 上的 BTCB），"
+                                "不是全网市值，禁止当作标的总市值使用",
+                }
+                return out
+    out["matched"] = None
+    out["note"] = f"未在 {list(DD_CHAINS.values())} 情绪榜中找到 {base}（该榜每链约 20 个热门代币）"
+    return out
+
+
+def dd_token_profile(base: str, chain_id: int | None, contract: str | None, sentiment: dict) -> dict:
+    """代币信息 + 合约安全（dogdoing /api/token-info、/api/token-audit）
+    优先用显式 --chain-id/--contract；否则用情绪榜自动解析到的合约地址。"""
+    cid, ca = chain_id, contract
+    if not (cid and ca):
+        m = (sentiment or {}).get("matched") or {}
+        if m.get("contract_address") and m.get("chain_id"):
+            cid, ca = m["chain_id"], m["contract_address"]
+            src = "自动解析（来自情绪榜匹配）"
+        else:
+            return {"status": "未取到",
+                    "reason": "未指定 --chain-id/--contract，且情绪榜未匹配到该代币合约；"
+                              "主流币（BTC/ETH）在 dogdoing 无对应 on-chain 代币页，属正常"}
+    else:
+        src = "用户指定"
+    ti = (soft(lambda: get(f"{DD}/api/token-info?chainId={cid}&contractAddress={ca}")) or {}).get("data") or {}
+    ta = (soft(lambda: get(f"{DD}/api/token-audit?chainId={cid}&contractAddress={ca}")) or {}).get("data") or {}
+    if not ti and not ta:
+        return {"status": "未取到", "reason": f"token-info/token-audit 对该合约无返回（chainId={cid}）", "source": src}
+    mcap, fdv = _f(ti.get("marketCap"), 0), _f(ti.get("fdv"), 0)
+    top10 = _f(ti.get("top10HoldersPercent"), 2)
+    is_major = base.upper() in {"BTC","ETH","BNB","SOL","XRP","DOGE","ADA","TRX","LINK","AVAX","LTC","DOT","TON","SHIB","UNI","BCH"}
+    return {
+        "status": "已取到", "source": src, "chain_id": cid,
+        "scope": "链上代币口径",
+        "scope_warning": ("⚠️ 链上代币（如 BSC 上的封装资产），其市值/持有人/流动性**不等于该币全网口径**，"
+                          "只可作链上活跃度参考，禁止作为标的总市值或总流动性写进结论"
+                          if is_major else
+                          "市值为该链上代币口径；跨链同名代币需分别核对"),
+        "chain_name": DD_CHAINS.get(cid, str(cid)), "contract_address": ca,
+        "name": ti.get("name"), "symbol": ti.get("symbol"),
+        "price": _f(ti.get("price"), 8), "price_change_24h_pct": _f(ti.get("priceChange24h"), 2),
+        "volume_24h_usd": _f(ti.get("volume24h"), 0), "liquidity_usd": _f(ti.get("liquidity"), 0),
+        "market_cap_usd": mcap, "fdv_usd": fdv,
+        "market_cap_to_fdv_pct": _f(mcap / fdv * 100, 1) if (mcap and fdv) else None,
+        "unlock_overhang_pct": _f((1 - mcap / fdv) * 100, 1) if (mcap and fdv) else None,
+        "holders": _f(ti.get("holders"), 0),
+        "top10_holders_pct": top10,
+        "top10_reading": ("持仓高度集中(抛压/操纵风险)" if (top10 or 0) > 50
+                          else "持仓较集中" if (top10 or 0) > 20 else "持仓分散"),
+        "liquidity_to_mcap_pct": _f(ti.get("liquidity", 0) and _f(ti.get("liquidity"), 0) / mcap * 100, 2) if mcap else None,
+        "description": (ti.get("description") or "")[:400],
+        "audit": {"risk_level": ta.get("riskLevel"), "risk_score": ta.get("riskScore"),
+                  "buy_tax": ta.get("buyTax"), "sell_tax": ta.get("sellTax"),
+                  "verified": ta.get("isVerified"),
+                  "hits": [r.get("title") for r in (ta.get("risks") or []) if r.get("isHit")]} if ta else None,
+    }
+
+
+def dd_kol_views(base: str, limit: int = 3) -> dict:
+    """KOL/分析师观点（dogdoing /api/serenity-tweets，带中文原文与 $TICKER 标签）"""
+    d = soft(lambda: get(f"{DD}/api/serenity-tweets")) or {}
+    rows = d.get("data") or []
+    if not rows:
+        return {}
+    hits = [r for r in rows
+            if base.upper() in str(r.get("tickers") or "").upper()
+            or base.upper() in str(r.get("textOriginal") or "").upper()]
+    pick = hits[:limit] if hits else sorted(rows, key=lambda x: -(_f(x.get("viewCount"), 0) or 0))[:limit]
+    return {"scope": "标的直接相关" if hits else "无标的直接提及，取浏览量最高的市场观点",
+            "tweets": [{"text": (r.get("textCN") or r.get("textOriginal") or "")[:300],
+                        "tickers": r.get("tickers"), "url": r.get("url"),
+                        "views": _f(r.get("viewCount"), 0), "likes": _f(r.get("favoriteCount"), 0),
+                        "posted_utc": datetime.fromtimestamp(int(r["createdAt"]) / 1000, timezone.utc).strftime("%m-%d %H:%M") if r.get("createdAt") else None}
+                       for r in pick]}
+
+
+def dd_event_markets(limit: int = 4) -> dict:
+    """预测市场隐含概率（dogdoing /api/prediction-markets）——事件驱动的量化参照"""
+    d = soft(lambda: get(f"{DD}/api/prediction-markets?limit=40")) or {}
+    rows = [r for r in (d.get("data") or []) if (r.get("volume") or 0) > 0]
+    rows.sort(key=lambda r: -(r.get("volume") or 0))
+    out = []
+    for r in rows[:limit]:
+        outs, prob_sum = [], 0.0
+        for o in (r.get("outcomes") or [])[:6]:
+            pr = _f(o.get("price"), 6)
+            if pr is not None:
+                prob_sum += pr
+            outs.append({"outcome": o.get("name"), "implied_prob_pct": _f(pr * 100, 1) if pr is not None else None})
+        valid = 0.9 <= prob_sum <= 1.1
+        out.append({"question": r.get("question"), "volume_usd": _f(r.get("volume"), 0),
+                    "traders": _f(r.get("traders"), 0), "end_date": r.get("endDate"),
+                    "outcomes": outs, "prob_sum_raw": _f(prob_sum, 4),
+                    "distribution_valid": valid,
+                    "reading": "报价构成完整概率分布，可作绝对概率参考" if valid else
+                               f"报价合计仅 {_f(prob_sum*100,1)}%（≠100%）：**不是完整概率分布**，只能当相对排序参考，禁止当绝对概率"})
+    return {"markets": out,
+            "_use": "预测市场：仅 distribution_valid=true 的市场可作绝对概率；否则只看相对排序，且须看 volume 判断参考性"}
+
+
+def dd_alpha_hotspots(chain_id: int = 56, limit: int = 5) -> dict:
+    """Alpha/Meme 热点话题与资金净流入（dogdoing /api/hotspots）"""
+    d = soft(lambda: get(f"{DD}/api/hotspots?chainId={chain_id}")) or {}
+    rows = d.get("data") or []
+    if not rows:
+        return {}
+    out = []
+    for r in rows[:limit]:
+        toks = [{"symbol": t.get("symbol"), "price_change_pct": _f(t.get("priceChange"), 2),
+                 "market_cap_usd": _f(t.get("marketCap"), 0), "net_inflow": _f(t.get("netInflow"), 6)}
+                for t in (r.get("tokens") or [])[:5]]
+        out.append({"topic": r.get("name"), "type": r.get("type"), "net_inflow": _f(r.get("netInflow"), 6),
+                    "tokens": toks, "link": r.get("topicLink")})
+    return {"chain": DD_CHAINS.get(chain_id, str(chain_id)), "topics": out}
+
+
+def dd_news(base: str, limit: int = 5) -> dict:
+    d = soft(lambda: get(f"{DD}/api/news")) or {}
+    rows = d.get("data") or []
+    if not rows:
+        return {}
+    aliases = CN_NAMES.get(base.upper(), ())
+
+    def hit(n):
+        t = f"{n.get('title','')} {n.get('body','')}"
+        return base.upper() in t.upper() or any(al in t for al in aliases)
+
+    mine = [n for n in rows if hit(n)]
+    return {"scope": "标的直接相关" if mine else "无标的直接新闻，返回全市场要闻",
+            "items": [{"title": n.get("title"), "source": n.get("source"), "url": n.get("url"),
+                       "published_utc": datetime.fromtimestamp(int(n["publishedAt"]) / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M") if n.get("publishedAt") else None,
+                       "summary": (n.get("body") or "")[:300]}
+                      for n in (mine or rows)[:limit]]}
+
+
+def dogdoing_block(base: str, chain_id: int | None = None, contract: str | None = None) -> dict:
+    """dogdoing.ai 聚合层（唯一聚合数据源）：情绪/热度/OI背离/代币信息/安全/KOL/事件/资讯"""
     out: dict = {"_source": "dogdoing.ai 公开 JSON 接口（Binance Skills Hub 聚合层）"}
 
+    # ① 币安广场社交热度榜
     hype = soft(lambda: get(f"{DD}/api/square-hype")) or {}
     items = hype.get("data") or []
     if items:
@@ -507,6 +664,7 @@ def dogdoing_block(base: str, news_limit: int = 5) -> dict:
         out["square_hype_top5"] = [{"symbol": x.get("symbol"), "score": x.get("score"),
                                     "change_pct": _f(x.get("priceChangePct"), 1)} for x in items[:5]]
 
+    # ② OI 背离监控
     oid = soft(lambda: get(f"{DD}/api/oi-divergence")) or {}
     oitems = oid.get("data") or []
     if oitems:
@@ -529,116 +687,54 @@ def dogdoing_block(base: str, news_limit: int = 5) -> dict:
         else:
             out["oi_divergence"] = {"divergence_ratio": None, "reading": "未进入 OI 背离监控榜（无异常增仓）"}
 
+    # ③ 恐惧贪婪指数（dogdoing 为唯一来源）
     fg = soft(lambda: get(f"{DD}/api/fear-greed"))
     if isinstance(fg, dict) and fg.get("value") is not None:
-        out["fear_greed_dogdoing"] = {"value": fg.get("value"), "label": fg.get("label")}
+        v = int(fg["value"])
+        out["fear_greed"] = {"value": v, "label": fg.get("label"),
+                             "reading": ("极度贪婪：情绪风险高，追多危险" if v >= 75 else
+                                         "贪婪" if v >= 50 else "恐惧" if v >= 25 else "极度恐惧：往往对应机会")}
 
+    # ④ AI 情绪 + 社交热度值 + 情绪摘要
+    sent = dd_sentiment(base)
+    out["sentiment"] = sent
+
+    # ⑤ 代币信息 + 合约安全（用显式参数或情绪榜自动解析的合约）
+    out["token_profile"] = dd_token_profile(base, chain_id, contract, sent)
+
+    # ⑥ KOL/分析师观点
+    out["kol_views"] = dd_kol_views(base)
+
+    # ⑦ 预测市场隐含概率
+    out["event_markets"] = dd_event_markets()
+
+    # ⑧ Alpha/Meme 热点与资金净流入
+    out["alpha_hotspots"] = dd_alpha_hotspots()
+
+    # ⑨ 涨跌幅榜（市场广度）
+    gn = (soft(lambda: get(f"{DD}/api/gainers")) or {}).get("data") or []
+    ls = (soft(lambda: get(f"{DD}/api/losers")) or {}).get("data") or []
+    if gn or ls:
+        out["market_breadth"] = {
+            "top_gainers": [{"symbol": x.get("symbol"), "change_pct": _f(x.get("change"), 2),
+                             "volume_usd": _f(x.get("volume"), 0)} for x in gn[:5]],
+            "top_losers": [{"symbol": x.get("symbol"), "change_pct": _f(x.get("change"), 2),
+                            "volume_usd": _f(x.get("volume"), 0)} for x in ls[:5]],
+            "_use": "涨幅榜热度可判断资金主线是否在自己标的上（若标的未上榜，说明资金在别处）",
+        }
+
+    # ⑩ 资讯
+    out["news"] = dd_news(base)
+
+    # ⑪ 价格交叉校验
     ticks = soft(lambda: get(f"{DD}/api/market-tickers")) or {}
     tdata = ticks.get("data") or []
-    mine = [x for x in tdata if _sym_match(x.get("symbol"), base)]
-    if mine:
-        out["price_cross_check"] = {"dogdoing_price": _f(mine[0].get("price"), 6),
-                                    "dogdoing_change_24h_pct": _f(mine[0].get("change"), 2),
+    mine_t = [x for x in tdata if _sym_match(x.get("symbol"), base)]
+    if mine_t:
+        out["price_cross_check"] = {"dogdoing_price": _f(mine_t[0].get("price"), 6),
+                                    "dogdoing_change_24h_pct": _f(mine_t[0].get("change"), 2),
                                     "_purpose": "与交易所 API 现价交叉校验，偏差过大说明数据陈旧"}
-
-    news = soft(lambda: get(f"{DD}/api/news")) or {}
-    nlist = news.get("data") or []
-    if nlist:
-        aliases = CN_NAMES.get(base.upper(), ())
-        def hit(n):
-            t = f"{n.get('title','')} {n.get('body','')}"
-            return base.upper() in t.upper() or any(al in t for al in aliases)
-        mine_news = [n for n in nlist if hit(n)]
-        out["news"] = [{"title": n.get("title"), "source": n.get("source"), "url": n.get("url"),
-                        "published_utc": datetime.fromtimestamp(int(n["publishedAt"]) / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M") if n.get("publishedAt") else None,
-                        "summary": (n.get("body") or "")[:300]}
-                       for n in (mine_news or nlist)[:news_limit]]
-        out["news_scope"] = "标的直接相关" if mine_news else "无标的直接新闻，返回全市场要闻"
     return out
-
-
-# ───────────────────────── 全局 / 代币经济 ─────────────────────────
-
-CG_IDS = {"btc": "bitcoin", "eth": "ethereum", "sol": "solana", "bnb": "binancecoin",
-          "xrp": "ripple", "doge": "dogecoin", "ada": "cardano", "trx": "tron",
-          "link": "chainlink", "avax": "avalanche-2", "ltc": "litecoin", "dot": "polkadot",
-          "sui": "sui", "apt": "aptos", "arb": "arbitrum", "op": "optimism",
-          "pepe": "pepe", "wif": "dogwifcoin", "ton": "the-open-network", "near": "near",
-          "hype": "hyperliquid", "ena": "ethena", "ondo": "ondo-finance", "tao": "bittensor"}
-
-
-def cg_block(symbol: str) -> dict:
-    base = symbol.upper().replace("USDT", "").replace("USDC", "").lower()
-    cid = CG_IDS.get(base, base)
-    m = soft(lambda: get(f"{CG}/coins/markets?vs_currency=usd&symbols={base}"))
-    out: dict = {}
-    if isinstance(m, list) and m:
-        c = m[0]
-        circ, tot, maxs = c.get("circulating_supply"), c.get("total_supply"), c.get("max_supply")
-        fdv = c.get("fully_diluted_valuation") or c.get("market_cap")
-        out = {
-            "coingecko_id": c.get("id"), "name": c.get("name"), "rank": c.get("market_cap_rank"),
-            "market_cap_usd": _f(c.get("market_cap"), 0), "fdv_usd": _f(fdv, 0),
-            "market_cap_to_fdv_pct": _f(c.get("market_cap", 0) / fdv * 100, 1) if fdv else None,
-            "circulating_supply": _f(circ, 0), "total_supply": _f(tot, 0), "max_supply": _f(maxs, 0),
-            "unlock_overhang_pct": _f((1 - (circ or 0) / maxs) * 100, 1) if (circ and maxs) else None,
-            "ath_usd": _f(c.get("ath"), 6), "ath_change_pct": _f(c.get("ath_change_percentage"), 2),
-            "atl_usd": _f(c.get("atl"), 6),
-            "price_change_7d_pct": _f(c.get("price_change_percentage_7d_in_currency"), 2),
-            "price_change_30d_pct": _f(c.get("price_change_percentage_30d_in_currency"), 2),
-            "total_volume_usd_24h": _f(c.get("total_volume"), 0),
-            "volume_to_mcap_pct": _f(c.get("total_volume", 0) / c.get("market_cap", 1) * 100, 2),
-            "note": "unlock_overhang_pct = (1 − 流通量/最大供应量)×100，为解锁抛压代理（免费接口无精确解锁日历）",
-        }
-    return out
-
-
-def global_block() -> dict:
-    g = soft(lambda: get(f"{CG}/global"))
-    d = (g or {}).get("data") or {}
-    out = {}
-    if d:
-        out = {
-            "total_market_cap_usd": _f((d.get("total_market_cap") or {}).get("usd"), 0),
-            "total_market_cap_change_24h_pct": _f(d.get("market_cap_change_percentage_24h_usd"), 2),
-            "btc_dominance_pct": _f((d.get("market_cap_percentage") or {}).get("btc"), 2),
-            "eth_dominance_pct": _f((d.get("market_cap_percentage") or {}).get("eth"), 2),
-            "total_volume_usd_24h": _f((d.get("total_volume") or {}).get("usd"), 0),
-            "active_cryptocurrencies": d.get("active_cryptocurrencies"),
-        }
-    # 稳定币净流入代理：market_cap 变化 ≈ 净发行
-    flow = {}
-    for cid in ("tether", "usd-coin"):
-        mc = soft(lambda c=cid: get(f"{CG}/coins/{c}/market_chart?vs_currency=usd&days=30&interval=daily"))
-        pts = ((mc or {}).get("market_caps") or [])
-        if len(pts) > 3:
-            vals = [p[1] for p in pts]
-            flow[cid] = {"mcap_usd": _f(vals[-1], 0), "change_7d_pct": _pct(vals[-1], vals[-8]) if len(vals) > 8 else None,
-                         "change_30d_pct": _pct(vals[-1], vals[0]),
-                         "net_issuance_30d_usd": _f(vals[-1] - vals[0], 0)}
-    if flow:
-        tot7 = sum(v["change_7d_pct"] for v in flow.values() if v.get("change_7d_pct") is not None) / max(len(flow), 1)
-        tot30 = sum(v["net_issuance_30d_usd"] for v in flow.values() if v.get("net_issuance_30d_usd") is not None)
-        out["stablecoin_proxy"] = {"per_asset": flow, "mean_7d_change_pct": _f(tot7, 3),
-                                   "net_issuance_30d_usd": _f(tot30, 0),
-                                   "interpretation": "稳定币市值=场内购买力代理：净增发=潜在增量买盘，缩水=资金离场或赎回",
-                                   "method": "USDT+USDC 市值变化代理净发行（价格≈1 美元）"}
-    return out
-
-
-def fear_greed() -> dict:
-    d = soft(lambda: get("https://api.alternative.me/fng/?limit=30"))
-    data = (d or {}).get("data") or []
-    if not data:
-        return {}
-    vals = [(int(x["value"]), x["value_classification"], x["timestamp"]) for x in data]
-    cur = vals[0]
-    arr = [v for v, _, _ in vals]
-    return {"current": cur[0], "classification": cur[1],
-            "date_utc": datetime.fromtimestamp(int(cur[2]), timezone.utc).strftime("%Y-%m-%d"),
-            "mean_30d": _f(st.mean(arr), 1), "min_30d": min(arr), "max_30d": max(arr),
-            "percentile_30d": _f(sum(1 for v in arr if v <= cur[0]) / len(arr) * 100, 0),
-            "legend": "0-24 极度恐惧 / 25-49 恐惧 / 50-74 贪婪 / 75-100 极度贪婪"}
 
 
 # ───────────────────────── 风险与仓位（TypeSafe 0.98 判定的模型） ─────────────────────────
@@ -766,18 +862,34 @@ def render_dashboard(d: dict) -> str:
         L.append(f"| 相对 BTC（30d 超额） | {rs['vs_btc']['30d'].get('excess_pct')}% |")
     if rs.get("corr_beta_btc_90d"):
         L.append(f"| 与 BTC 相关性 / Beta（90d） | {rs['corr_beta_btc_90d'].get('corr')} / {rs['corr_beta_btc_90d'].get('beta')} |")
-    fg = d.get("fear_greed", {})
-    if fg:
-        L.append(f"| 恐惧贪婪指数 | {fg.get('current')}（{fg.get('classification')}，30日分位 {fg.get('percentile_30d')}%） |")
-    g = d.get("global_market", {})
-    if g:
-        L.append(f"| 全市场市值 / BTC 占比 | {_n(g.get('total_market_cap_usd'))} USD / {g.get('btc_dominance_pct')}% |")
-    if g.get("stablecoin_proxy"):
-        L.append(f"| 稳定币 30 日净发行（代理） | {_n(g['stablecoin_proxy'].get('net_issuance_30d_usd'))} USD |")
-    tkn = d.get("tokenomics", {})
-    if tkn:
-        L.append(f"| 市值 / FDV / 解锁悬顶 | {_n(tkn.get('market_cap_usd'))} / {_n(tkn.get('fdv_usd'))} / {tkn.get('unlock_overhang_pct')}% |")
     ag = d.get("aggregator", {})
+    fg = ag.get("fear_greed", {})
+    if fg:
+        L.append(f"| 恐惧贪婪指数（dogdoing） | {fg.get('value')}（{fg.get('label')}）· {fg.get('reading')} |")
+    sm = (ag.get("sentiment") or {}).get("matched")
+    if sm:
+        L.append(f"| AI 情绪（{sm.get('chain')}） | {sm.get('sentiment')} · 社交热度值 {_n(sm.get('social_hype_value'))} |")
+    tp = ag.get("token_profile") or {}
+    if tp.get("status") == "已取到":
+        L.append(f"| 链上代币信息（{tp.get('chain_name')} · {tp.get('source')} · {tp.get('scope')}） | {tp.get('name')}（{tp.get('symbol')}） |")
+        if tp.get("scope_warning"):
+            L.append(f"| ⚠️ 口径提醒 | {tp['scope_warning'][:110]} |")
+        L.append(f"| 市值 / FDV / 解锁悬顶 | {_n(tp.get('market_cap_usd'))} / {_n(tp.get('fdv_usd'))} / {tp.get('unlock_overhang_pct')}% |")
+        L.append(f"| 持有人 / Top10 集中度 / 流动性 | {_n(tp.get('holders'))} / {tp.get('top10_holders_pct')}%（{tp.get('top10_reading')}） / {_n(tp.get('liquidity_usd'))} USD |")
+        au = tp.get("audit")
+        if au:
+            L.append(f"| 合约审计 | 风险 {au.get('risk_level')}（{au.get('risk_score')}）· 买/卖税 {au.get('buy_tax')}/{au.get('sell_tax')} · 命中 {au.get('hits')} |")
+    elif tp:
+        L.append(f"| 代币信息 | 未取到（{str(tp.get('reason'))[:60]}） |")
+    kv = ag.get("kol_views") or {}
+    if kv.get("tweets"):
+        L.append(f"| KOL 观点 | {len(kv['tweets'])} 条（{kv.get('scope')}） |")
+    em = ag.get("event_markets") or {}
+    if em.get("markets"):
+        L.append(f"| 预测市场隐含概率 | {em['markets'][0].get('question')[:40]}（vol {_n(em['markets'][0].get('volume_usd'))}） |")
+    mb = ag.get("market_breadth") or {}
+    if mb.get("top_gainers"):
+        L.append(f"| 涨幅榜 Top3 | {', '.join(str(x.get('symbol')) + ' ' + str(x.get('change_pct')) + '%' for x in mb['top_gainers'][:3])} |")
     sh = ag.get("square_hype")
     if sh:
         L.append(f"| 币安广场社交热度（dogdoing） | 评分 {sh.get('score')} · 排名 {sh.get('rank')}/{sh.get('of_total')} · {sh.get('reading')} |")
@@ -787,8 +899,9 @@ def render_dashboard(d: dict) -> str:
     cc = ag.get("price_cross_check")
     if cc and cc.get("verdict"):
         L.append(f"| 聚合源价格交叉校验 | 偏差 {cc.get('deviation_vs_exchange_pct')}%（{cc.get('verdict')}） |")
-    if ag.get("news"):
-        L.append(f"| 相关资讯 | {len(ag['news'])} 条（{ag.get('news_scope')}） |")
+    nw = ag.get("news") or {}
+    if nw.get("items"):
+        L.append(f"| 相关资讯 | {len(nw['items'])} 条（{nw.get('scope')}） |")
     rk = d.get("risk_framework", {})
     if rk.get("table"):
         r = [x for x in rk["table"] if x["risk_budget_pct"] == 1.0 and x["stop_atr_mult"] == 2.0]
@@ -800,8 +913,8 @@ def render_dashboard(d: dict) -> str:
 
 # ───────────────────────── 主流程 ─────────────────────────
 
-def build(symbol: str, venue: str, equity: float, use_cg: bool, risk: float, use_dd: bool = True,
-          exchange_leverage: float = 5.0) -> dict:
+def build(symbol: str, venue: str, equity: float, risk: float, use_dd: bool = True,
+          exchange_leverage: float = 5.0, chain_id: int | None = None, contract: str | None = None) -> dict:
     symbol = symbol.upper().replace("-", "").replace("/", "")
     base = symbol.replace("USDT", "").replace("USDC", "")
     htx_contract = f"{base}-USDT"
@@ -900,7 +1013,7 @@ def build(symbol: str, venue: str, equity: float, use_cg: bool, risk: float, use
                  "as_of": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
                  "last_bar_4h_utc": str(spot_4h.index[-1])[:19] if len(spot_4h) else None,
                  "trading_hours": "7x24 连续，无收盘与隔夜缺口",
-                 "data_sources": "Binance 公开API + HTX 公开API + CoinGecko + alternative.me",
+                 "data_sources": "Binance 公开API + HTX 公开API + dogdoing.ai 聚合层（仅此两类）",
                  "reviewed_by": "TypeSafe jev-1.13.0（可迁移性1.50 / 仓位模型0.98 / 场所风险0.95）"},
         "price": {"mark_price": mark, "spot_price": price, "basis_bps": basis_bps,
                   "change_24h_pct": _f(tk24.get("priceChangePercent"), 2),
@@ -918,19 +1031,10 @@ def build(symbol: str, venue: str, equity: float, use_cg: bool, risk: float, use
         "positioning": positioning,
         "liquidity": {**liq, "session_profile": vol_hour},
         "relative_strength": rs,
-        "fear_greed": fear_greed(),
         "risk_framework": risk_framework(vol.get("atr_pct_4h") or 0, price, equity, exchange_leverage=exchange_leverage),
     }
-    if use_cg:
-        d["tokenomics"] = cg_block(symbol) or {}
-        d["global_market"] = global_block() or {}
-        if not d["global_market"].get("total_market_cap_usd"):
-            gaps.append("CoinGecko 全市场数据未取到（/global 失败，BTC 占比与稳定币流量缺失）")
-        d["meta"]["cg_name"] = (d["tokenomics"] or {}).get("name")
-        if not d["tokenomics"]:
-            gaps.append("CoinGecko 代币经济未取到（该币可能无收录）")
     if use_dd:
-        d["aggregator"] = dogdoing_block(base)
+        d["aggregator"] = dogdoing_block(base, chain_id=chain_id, contract=contract)
         ag = d["aggregator"]
         cc = ag.get("price_cross_check") or {}
         if cc.get("dogdoing_price") and price:
@@ -939,10 +1043,18 @@ def build(symbol: str, venue: str, equity: float, use_cg: bool, risk: float, use
             cc["verdict"] = "一致" if dev < 1 else "偏差>1%：该聚合源价格可能陈旧，以交易所价为准"
         if not ag.get("news"):
             gaps.append("dogdoing 资讯接口未返回内容")
+        if not (ag.get("sentiment") or {}).get("matched"):
+            gaps.append("dogdoing 情绪榜未匹配到该代币（该榜每链约 20 个热门代币；热门榜覆盖有限）")
+        tp = ag.get("token_profile") or {}
+        if tp.get("status") != "已取到":
+            gaps.append(f"代币信息/合约审计未取到：{str(tp.get('reason'))[:80]}")
+        if not (ag.get("fear_greed") or {}):
+            gaps.append("dogdoing 恐惧贪婪指数未取到")
     d["data_quality"] = {
         "missing_or_degraded": gaps,
         "no_fundamentals": "加密资产无财报/分析师覆盖/机构13F；本快照以『资金费率+OI+多空比+社交热度+流动性+代币经济』替代股票的基本面输入，禁止编造财报类结论。",
-        "aggregator_source": "社交热度/OI背离/资讯来自 dogdoing.ai 公开 JSON 接口；价格类结论一律以交易所 API 为准。",
+        "aggregator_source": "社交热度/情绪/OI背离/代币信息/合约审计/资讯均来自 dogdoing.ai 公开 JSON 接口；价格类结论一律以交易所 API 为准。",
+        "token_scope": "dogdoing 的代币市值/持有人/流动性是**链上代币口径**（含封装资产），不等于全网口径；无全网市值数据源，禁止据此推算全网估值。",
         "liquidation_data": "无免费清算明细接口，清算聚集区为代理指标（结构极点+高量区+整数关口）。",
         "onchain_data": "链上数据（交易所余额/巨鲸转账）需付费接口，本快照用稳定币净发行+流通量/解锁悬顶作代理。",
     }
@@ -956,14 +1068,16 @@ def main() -> int:
     ap.add_argument("--equity", type=float, default=10_000.0, help="账户权益(USD)，用于仓位模型")
     ap.add_argument("--risk", type=float, default=1.0, help="每笔风险预算百分比，仅用于打印摘要")
     ap.add_argument("--leverage", type=float, default=5.0, help="交易所杠杆设定值，用于保证金与强平距离计算（默认5x）")
-    ap.add_argument("--no-cg", action="store_true", help="跳过 CoinGecko（更快）")
+    ap.add_argument("--chain-id", type=int, default=None, help="链ID(56=BSC/8453=Base/1=ETH)，用于取代币信息与合约审计")
+    ap.add_argument("--contract", default=None, help="代币合约地址，配合 --chain-id 使用")
     ap.add_argument("--no-dogdoing", action="store_true", help="跳过 dogdoing.ai 聚合层（社交热度/OI背离/资讯）")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
     out_dir = a.out or os.path.join(os.path.expanduser("~"), "crypto_snapshots")
     os.makedirs(out_dir, exist_ok=True)
-    d = build(a.symbol, a.venue, a.equity, not a.no_cg, a.risk, not a.no_dogdoing, a.leverage)
+    d = build(a.symbol, a.venue, a.equity, a.risk, not a.no_dogdoing, a.leverage,
+              chain_id=a.chain_id, contract=a.contract)
     day = datetime.now(timezone.utc).strftime("%Y%m%d")
     safe = d["meta"]["symbol"]
     jp = os.path.join(out_dir, f"snapshot_{safe}_{day}.json")
