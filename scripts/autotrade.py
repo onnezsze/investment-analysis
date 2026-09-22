@@ -200,15 +200,28 @@ def main() -> int:
         rec["executed"] = True
         lines.append(f"　→ ✅ 已下单 {entry['side']} {entry['quantity']} {sym}（订单号 {resp.get('orderId')}）")
         # 止损/止盈条件单
+        prot_ok, prot_fail = 0, []
         for kind, trig in (("STOP_MARKET", plan["stop"]), ("TAKE_PROFIT_MARKET", plan["tp1"])):
-            sp = bx.spec(sym)
-            q = {"symbol": sym, "side": ("SELL" if side == "buy" else "BUY"), "type": kind,
-                 "quantity": entry["quantity"], "reduceOnly": "true",
-                 "stopPrice": bx.fmt(bx.round_tick(trig, sp["tick_size"]), sp["tick_size"]),
-                 "workingType": "MARK_PRICE"}
-            r2 = bx._req("POST", "/fapi/v1/order", q)
-            lines.append(f"　　{kind} @ {q['stopPrice']} → {'OK' if not r2.get('_error') else r2.get('msg')}")
-            rec.setdefault("protective_orders", []).append({"type": kind, "stop_price": q["stopPrice"], "resp": r2})
+            res = bx.place_protective(sym, side, entry["quantity"], kind, trig)
+            r2 = res["resp"]
+            ok = not r2.get("_error")
+            prot_ok += 1 if ok else 0
+            lines.append(f"　　{kind} @ {trig}（{res['api']}）→ {'✅ OK' if ok else '❌ ' + str(r2.get('msg'))[:70]}")
+            rec.setdefault("protective_orders", []).append(
+                {"type": kind, "trigger": trig, "api": res["api"], "resp": r2})
+            if not ok:
+                prot_fail.append(kind)
+        # 兜底：止损单必须挂上；否则立即平仓，绝不留下无保护仓位
+        stop_ok = any(o["type"] == "STOP_MARKET" and not o["resp"].get("_error")
+                      for o in rec.get("protective_orders", []))
+        if not stop_ok:
+            close_q = {"symbol": sym, "side": ("SELL" if side == "buy" else "BUY"),
+                       "type": "MARKET", "quantity": entry["quantity"], "reduceOnly": "true"}
+            rc = bx._req("POST", "/fapi/v1/order", close_q)
+            lines.append(f"　　🚨 止损单未挂上 → 已立即平仓兜底：{json.dumps(rc, ensure_ascii=False)[:140]}")
+            rec["emergency_close"] = rc
+            rec["executed"] = False
+            rec["verdict"] += "｜保护单失败已平仓"
         record(TRADES_LOG, rec)
 
     out = "\n".join(lines)

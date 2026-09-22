@@ -249,13 +249,46 @@ def cmd_order(a) -> None:
     for kind, trigger in (("STOP_MARKET", a.sl), ("TAKE_PROFIT_MARKET", a.tp)):
         if not trigger:
             continue
-        sp = spec(a.symbol)
-        q = {"symbol": a.symbol, "side": ("SELL" if a.side.lower() == "buy" else "BUY"),
-             "type": kind, "quantity": p["quantity"], "reduceOnly": "true",
-             "stopPrice": fmt(round_tick(trigger, sp["tick_size"]), sp["tick_size"]),
-             "workingType": "MARK_PRICE"}
-        r2 = _req("POST", "/fapi/v1/order", q)
-        print(f"{kind} @ {q['stopPrice']} 回执:", json.dumps(r2, ensure_ascii=False))
+        res = place_protective(a.symbol, a.side, p["quantity"], kind, trigger)
+        r2 = res["resp"]
+        tag = "✅" if not r2.get("_error") else "❌"
+        print(f"{tag} {kind} 触发价 {trigger}（{res['api']} 端点）: {json.dumps(r2, ensure_ascii=False)[:200]}")
+        if r2.get("_error"):
+            print(f"   ⚠️ 保护单失败 → 建议立即平仓（python3 binance_exec.py close {a.symbol} --live）")
+
+
+def place_protective(symbol: str, side: str, qty: str, kind: str, trigger: float) -> dict:
+    """挂保护单。tradfi 合约不支持标准 STOP_MARKET，自动回退 Algo Order API
+    （实测必需参数：algoType=CONDITIONAL + triggerPrice）"""
+    sp = spec(symbol)
+    close_side = "SELL" if side.lower() == "buy" else "BUY"
+    px = fmt(round_tick(trigger, sp["tick_size"]), sp["tick_size"])
+    base = {"symbol": symbol, "side": close_side, "type": kind, "quantity": qty,
+            "reduceOnly": "true", "workingType": "MARK_PRICE"}
+    r = _req("POST", "/fapi/v1/order", {**base, "stopPrice": px})
+    if not r.get("_error"):
+        return {"api": "standard", "resp": r}
+    msg = str(r.get("msg", ""))
+    if "not supported" not in msg and "Algo Order" not in msg:
+        return {"api": "standard", "resp": r}
+    r2 = _req("POST", "/fapi/v1/algoOrder",
+              {"symbol": symbol, "side": close_side, "type": kind, "quantity": qty,
+               "triggerPrice": px, "reduceOnly": "true", "workingType": "MARK_PRICE",
+               "algoType": "CONDITIONAL"})
+    return {"api": "algo", "resp": r2, "fallback_from": msg[:120]}
+
+
+def cmd_stops(a) -> None:
+    """列出当前 algo 保护单"""
+    r = _req("GET", "/fapi/v1/openAlgoOrders", {"symbol": a.symbol} if getattr(a, "symbol", None) else None)
+    if isinstance(r, dict) and r.get("_error"):
+        print(r)
+        return
+    if not r:
+        print("无 algo 保护单")
+    for o in r:
+        print(f"  {o['symbol']:10} {o['orderType']:20} {o['side']:4} 数量 {o['quantity']:>8} "
+              f"触发价 {o['triggerPrice']:>12} 状态 {o['algoStatus']} algoId {o['algoId']}")
 
 
 def cmd_close(a) -> None:
@@ -287,6 +320,7 @@ def main() -> int:
     sp = sub.add_parser("specs"); sp.add_argument("symbols", nargs="+"); sp.set_defaults(fn=cmd_specs)
     sl = sub.add_parser("set-leverage"); sl.add_argument("symbol"); sl.add_argument("leverage", type=int); sl.set_defaults(fn=cmd_set_leverage)
     so = sub.add_parser("orders"); so.add_argument("symbol", nargs="?"); so.set_defaults(fn=cmd_orders)
+    ss = sub.add_parser("stops"); ss.add_argument("symbol", nargs="?"); ss.set_defaults(fn=cmd_stops)
     sc = sub.add_parser("close"); sc.add_argument("symbol"); sc.set_defaults(fn=cmd_close)
     so2 = sub.add_parser("order")
     so2.add_argument("symbol"); so2.add_argument("side", choices=["buy", "sell"])
@@ -296,6 +330,10 @@ def main() -> int:
     so2.add_argument("--sl", type=float, help="止损触发价（reduceOnly STOP_MARKET）")
     so2.add_argument("--tp", type=float, help="止盈触发价（reduceOnly TAKE_PROFIT_MARKET）")
     so2.set_defaults(fn=cmd_order)
+
+    # 允许 --live 写在子命令之后（SUPPRESS 默认值不会覆盖顶层已给的 --live）
+    for _sp in set(sub.choices.values()):
+        _sp.add_argument("--live", action="store_true", default=argparse.SUPPRESS)
 
     a = ap.parse_args()
     a.fn(a)
