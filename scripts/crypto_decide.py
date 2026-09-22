@@ -361,8 +361,12 @@ def build_state(symbol: str, profile: str, equity: float, horizon_hours: float |
             "goal": f"判断在未来约 {hz} 小时内，{symbol} 是否值得开一笔方向性仓位（含成本），"
                     f"以及应选 long / short / no_trade",
             "timing": "决策后以限价或市价在数分钟内建仓，止损与止盈按结构位设置",
-            "inputs_priority": "最重要的是 taker_flow（CVD 与近期主动成交）与 positioning（资金费率/OI 拥挤度）；"
-                               "其次是 token_concentration（前10持仓集中度）、alpha_narratives（是否在叙事主线）、"
+            "inputs_priority": "**先看趋势与动量**：trend_relative_bps 里的 ema_position_pct（价格相对 EMA20/EMA50 的"
+                               "乖离）、rsi（4h/1h/1d）、以及 4h_bars/1h_bars 的多周期收益 —— 这是判断方向的第一依据；"
+                               "**逆势交易（如价格高于 EMA50 时做空、或低于 EMA50 时做多）必须给出极强理由**"
+                               "（例如明确的顶部结构+成交萎缩+资金费率极端），否则应给 no_trade。"
+                               "其次才是 taker_flow（CVD 与近期主动成交）与 positioning（资金费率/OI 拥挤度）；"
+                               "再其次是 token_concentration（前10持仓集中度）、alpha_narratives（是否在叙事主线）、"
                                "market_breadth（资金主线是否在本标的上）、sentiment、news_headlines、kol_views、event_markets；"
                                "其次 market_structure 的盘口失衡与深度；cost.total_cost_bps 是必须跨过的门槛；"
                                "structure_levels 决定止损位置，execution_constraints 决定杠杆与仓位上限",

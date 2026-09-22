@@ -316,7 +316,14 @@ def manage_positions(positions: dict, live: bool, profile: str, lines: list) -> 
         px = state["market_structure"]["price"]
         atr = state["trend_relative_bps"]["atr_pct_4h"] or 1.0
         T = cd.THESIS
-        act, reason = "HOLD", ""
+        # 新增：强逆势持仓的前提已失效（与建仓闸门同一规则）—— 规则更新后需清理存量
+        _tr = state["trend_relative_bps"]
+        _vs50 = (_tr.get("ema_position_pct") or {}).get("vs_ema50") or 0
+        _r20 = (_tr.get("4h_bars") or {}).get("last20") or 0
+        _reg = "up" if (_vs50 > 2 and _r20 > 0) else "down" if (_vs50 < -2 and _r20 < 0) else "range"
+        _ctp = (_reg == "up" and pos_dir == "short") or (_reg == "down" and pos_dir == "long")
+        _ctp_strong = _ctp and abs(_vs50) > 5 and abs(_r20) > 500
+        hold_guard = True
         # 护栏1：最小持仓时间 —— 模型驱动的退出不得早于 MIN_HOLD_MINUTES（交易所侧止损/止盈不受影响）
         held_min = None
         _rows = ledger_rows()
@@ -335,8 +342,12 @@ def manage_positions(positions: dict, live: bool, profile: str, lines: list) -> 
         prev = [h for h in hist if h.get("symbol") == sym and h.get("event") == "position_management"]
         prev_bad = bool(prev) and prev[-1].get("action") in ("CLOSE", "CLOSE_PENDING", "WEAK")
         extreme = p_pos < 0.30 or conf < 0.20          # 极端读数：立即处置，不等确认
+        # ⓪ 规则判定优先：强逆趋势持仓前提失效（与建仓闸门同一规则，属"规则"而非噪声，不受最小持仓时间限制）
+        if _ctp_strong:
+            act, reason = "CLOSE", (f"逆强趋势：4H 趋势={_reg}（价格距 EMA50 {_vs50:+.2f}%，"
+                                    f"20 根收益 {_r20:+.0f}bps），该方向禁止持有 → 平仓")
         # ① 论点反转（模型明确反对持仓方向，且置信度够高）
-        if young and not (extreme and prev_bad):
+        elif young and not (extreme and prev_bad):
             act, reason = "HOLD", (f"持仓仅 {held_min:.0f} 分钟（< {MIN_HOLD_MINUTES} 分钟护栏），"
                                    f"模型读数为 概率 {p_pos:.2f}／置信度 {conf} → 暂不处置，避免噪声甩单")
         elif choice and choice != pos_dir and choice != "no_trade" and conf >= T["reverse_conf"]:
@@ -558,7 +569,8 @@ def main() -> int:
                 if gated["action"] == "long":
                     below = [s for s in sups if s < price]
                     sd = min(price - s for s in below) if below else atr_abs
-                    sd = min(max(sd, 1.0 * atr_abs), 3.0 * atr_abs)
+                    # 止损必须越过噪声：下限 1.5xATR（原 1xATR 实测被噪声扫掉 —— AMD 止损 1.40%=1.00xATR，22 分钟即触发）
+                    sd = min(max(sd, 1.5 * atr_abs), 3.0 * atr_abs)
                     stop = round(price - sd, 6)
                     above = [r for r in res if r > price]
                     td = max((min(above) - price) if above else 0, rr_min * sd)
@@ -566,7 +578,8 @@ def main() -> int:
                 else:
                     above_r = [r for r in res if r > price]
                     sd = min(r - price for r in above_r) if above_r else atr_abs
-                    sd = min(max(sd, 1.0 * atr_abs), 3.0 * atr_abs)
+                    # 止损必须越过噪声：下限 1.5xATR（原 1xATR 实测被噪声扫掉 —— AMD 止损 1.40%=1.00xATR，22 分钟即触发）
+                    sd = min(max(sd, 1.5 * atr_abs), 3.0 * atr_abs)
                     stop = round(price + sd, 6)
                     below_s = [s for s in sups if s < price]
                     td = max((price - max(below_s)) if below_s else 0, rr_min * sd)
@@ -649,6 +662,30 @@ def main() -> int:
                 lines.append(f"　→ 仓位反推失败：{sz['reason']}，跳过")
                 record(TRADES_LOG, rec)
                 continue
+        # 建仓闸③c：逆势加价 —— 与 4H 趋势相反时要求更高置信度（不依赖模型自觉）
+        _tr = state["trend_relative_bps"]
+        _vs50 = (_tr.get("ema_position_pct") or {}).get("vs_ema50") or 0
+        _r20 = (_tr.get("4h_bars") or {}).get("last20") or 0
+        _regime = "up" if (_vs50 > 2 and _r20 > 0) else "down" if (_vs50 < -2 and _r20 < 0) else "range"
+        _ct = (_regime == "up" and gated["action"] == "short") or (_regime == "down" and gated["action"] == "long")
+        _strong = abs(_vs50) > 5 and abs(_r20) > 500          # 强趋势：乖离>5% 且 20 根收益>500bps
+        if _ct and _strong:
+            lines.append(f"　→ **禁止逆强趋势**：4H 趋势={_regime}（价格距 EMA50 {_vs50:+.2f}%，20 根收益 {_r20:+.0f}bps），"
+                         f"逆势方向不做（实测：3 笔逆势空单 2 亏 1 平，0 胜）→ 不开仓")
+            rec["counter_trend_blocked"] = {"regime": _regime, "vs_ema50_pct": _vs50, "r20_bps": _r20,
+                                            "rule": "strong_trend_block"}
+            record(TRADES_LOG, rec)
+            continue
+        if _ct:
+            _need = 0.75
+            if (gated["confidence"] or 0) < _need:
+                lines.append(f"　→ 逆势加价：4H 趋势={_regime}（价格距 EMA50 {_vs50:+.2f}%，20根收益 {_r20:+.0f}bps），"
+                             f"逆势方向需 conf ≥{_need}，实际 {gated['confidence']} → 不开仓")
+                rec["counter_trend_blocked"] = {"regime": _regime, "vs_ema50_pct": _vs50, "r20_bps": _r20,
+                                                "need_conf": _need, "conf": gated["confidence"]}
+                record(TRADES_LOG, rec)
+                continue
+            lines.append(f"　→ 逆势加价通过：趋势={_regime} 但 conf {gated['confidence']} ≥ {_need}")
         # 建仓闸④：保证金闸（拿到真实名义后校验；10 仓位下这才是真约束）
         _mg_ok, _mg_why = margin_ok(sz["notional_usd"], a.leverage, equity)
         if not _mg_ok:
