@@ -121,6 +121,12 @@ def main() -> int:
         return best[1] if best else None
 
     rows = []
+    # 交易成本（手续费+资金费）按标的+时间窗口归集，用于计算"成本占权益比"
+    cost_by = defaultdict(float)
+    for x in inc:
+        if x.get("incomeType") in ("COMMISSION", "FUNDING_FEE"):
+            cost_by[x.get("symbol")] += -float(x.get("income") or 0)
+    equity0 = 100.0
     for ep in eps:
         e = find_entry(ep["symbol"], ep["start_ms"])
         risk = (e or {}).get("risk_usd")
@@ -128,7 +134,9 @@ def main() -> int:
             s = e.get("sizing") or {}
             if s.get("notional_usd") and s.get("stop_distance_pct"):
                 risk = s["notional_usd"] * s["stop_distance_pct"] / 100
+        _cost = cost_by.get(ep["symbol"], 0.0)
         rows.append({"symbol": ep["symbol"], "time": ep["first"], "pnl": round(ep["pnl"], 4),
+                     "cost_over_equity_pct": round(_cost / equity0 * 100, 4),
                      "risk": round(risk, 4) if risk else None,
                      "R": round(ep["pnl"] / risk, 2) if risk else None,
                      "win": ep["pnl"] > 0,
@@ -147,8 +155,21 @@ def main() -> int:
     print()
     print(f"- **胜率 {wr:.1f}%**（{len(wins)}/{len(rows)}）｜ 合计净盈亏 **{tot:+.4f} USDT**"
           + (f"｜ 期望 **{exp_r:+.2f} R**/笔" if exp_r is not None else ""))
-    print(f"- 盈亏平衡胜率（RR=2.5）约 **28.6%** → " +
-          ("**高于平衡线，具备正边际的初步证据**" if wr > 28.6 else "**低于平衡线，当前无正边际证据**"))
+    # 含成本的盈亏平衡胜率： p* = (r + c) / (r × (RR+1))，c = 往返成本占权益比
+    rr_use = 2.5
+    r_use = 0.01
+    avg_inv = 100.0
+    costs = []
+    for r in rows:
+        if r.get("risk"):
+            costs.append(r["cost_over_equity_pct"] if r.get("cost_over_equity_pct") is not None else 0.0)
+    c_use = (sum(costs) / len(costs) / 100) if costs else 0.00075
+    p_star = (r_use + c_use) / (r_use * (rr_use + 1)) * 100
+    print(f"- **含成本盈亏平衡胜率 ≈ {p_star:.1f}%**（RR={rr_use}，风险 {r_use*100:.0f}%，"
+          f"实测往返成本 {c_use*10000:.1f} bps 权益；不含成本的理论线为 "
+          f"{1/(1+rr_use)*100:.1f}%）")
+    print(f"  → " + ("**高于含成本平衡线，具备正边际的初步证据**" if wr > p_star
+                     else f"**低于含成本平衡线（{p_star:.1f}%），当前无正边际证据**"))
     sides = defaultdict(lambda: [0, 0, 0.0])
     for r in rows:
         k = r["class"] or "unknown"

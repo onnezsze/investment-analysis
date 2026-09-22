@@ -84,6 +84,54 @@ def record(path: str, rec: dict) -> None:
         f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
 
 
+# 美股现金交易时段（EDT=UTC-4）：13:30–20:00 UTC，周一至周五
+# 2026 年 NYSE 主要休市日（近似，未含临时休市/提前收盘）
+US_HOLIDAYS_2026 = {
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+}
+
+
+def us_session(now=None) -> dict:
+    """返回美股时段状态：cash(现金交易) / premarket / afterhours / overnight / weekend / holiday"""
+    now = now or datetime.now(timezone.utc)
+    d = now.strftime("%Y-%m-%d")
+    mins = now.hour * 60 + now.minute
+    if now.weekday() >= 5:
+        return {"phase": "weekend", "label": "周末（美股休市）"}
+    if d in US_HOLIDAYS_2026:
+        return {"phase": "holiday", "label": "美股假期休市"}
+    if 13 * 60 + 30 <= mins < 20 * 60:
+        return {"phase": "cash", "label": "美股现金交易时段"}
+    if 20 * 60 <= mins:
+        return {"phase": "afterhours", "label": "美股盘后"}
+    if 9 * 60 <= mins < 13 * 60 + 30:
+        return {"phase": "premarket", "label": "美股盘前"}
+    return {"phase": "overnight", "label": "美股深夜（全天最薄时段）"}
+
+
+def session_gate(asset_class: str, phase: dict, spread_bps: float | None,
+                 stop_distance_pct: float | None) -> tuple[bool, float, str]:
+    """tradfi 时段闸门（实测：休市时段每小时成交额仅为开盘的 1/3，周末仅 1/6）
+    返回 (是否允许开仓, 仓位系数, 原因)"""
+    if asset_class != "tradfi":
+        return True, 1.0, ""            # 加密无时段效应（实测占比 29.8% ≈ 时间占比 27%）
+    p = phase["phase"]
+    if p in ("weekend", "holiday"):
+        return False, 0.0, f"{phase['label']} → tradfi 不新开仓（成交额仅为工作日的 1/6）"
+    if p == "overnight":
+        if spread_bps is not None and spread_bps > 5:
+            return False, 0.0, f"深夜时段价差 {spread_bps} bps > 5 → 不新开仓"
+        if stop_distance_pct is not None and stop_distance_pct < 1.5:
+            return False, 0.0, f"深夜时段止损仅 {stop_distance_pct:.2f}% < 1.5% → 薄量下易被插针扫损，不新开仓"
+        return True, 0.5, "深夜时段（薄量）→ 半仓 + 要求止损≥1.5%"
+    if p in ("premarket", "afterhours"):
+        if spread_bps is not None and spread_bps > 3:
+            return False, 0.0, f"{phase['label']}价差 {spread_bps} bps > 3 → 不新开仓"
+        return True, 0.5, f"{phase['label']}（流动性偏薄）→ 半仓"
+    return True, 1.0, ""                # 现金交易时段：正常
+
+
 def size_from_plan(wallet: float, risk_frac: float, price: float, stop: float,
                    leverage: float, venue_min_notional: float | None) -> dict:
     """从「实际挂单止损」反推仓位（风险预算 = wallet × risk_frac）。
@@ -176,8 +224,8 @@ def manage_positions(positions: dict, live: bool, profile: str, lines: list) -> 
             else:
                 act, reason = "CLOSE_PENDING", f"论点消失待确认（{why}）—— 首次读数不平仓，防单次噪声甩单"
         # ③ 论点弱化 → 已盈利则收紧到保本/更优，未盈利则警告（连续两次弱化则平仓）
-        elif p_pos < T["weaken_p"] or conf < 0.45:
-            # 盈利判定：多头=价格高于入场；空头=价格低于入场（此前写反，已在实盘前修正）
+        elif p_pos < T["weaken_p"]:
+            # 只有"方向概率退化"才算论点弱化（置信度受模型噪声影响大，不能单独触发平仓）
             in_profit = (px > entry) if pos_dir == "long" else (px < entry)
             if in_profit:
                 act, reason = "TIGHTEN", f"论点弱化（概率 {p_pos:.2f}／置信度 {conf}）且已盈利 → 收紧止损"
@@ -187,6 +235,10 @@ def manage_positions(positions: dict, live: bool, profile: str, lines: list) -> 
                              and h.get("action") == "WEAK"]
                 act, reason = ("CLOSE", "论点连续两次弱化且未盈利 → 平仓") if prev_weak else \
                               ("WEAK", f"论点弱化（概率 {p_pos:.2f}／置信度 {conf}）但未盈利 → 标记，下轮再弱化即平仓")
+        elif conf < 0.45:
+            # 方向概率仍在门槛之上，仅置信度偏低 → 持有（否则等于"用比开仓更弱的理由平仓"）
+            reason = (f"论点未退化：方向概率 {p_pos:.2f} 仍 ≥ 门槛 {cd.PROFILES[profile]['p_dir_min']}，"
+                      f"置信度 {conf} 偏低但不作为平仓依据 → 持有")
         else:
             reason = f"论点成立：{pos_dir} 概率 {p_pos:.2f}（置信度 {conf}）"
         # 执行
@@ -387,8 +439,20 @@ def main() -> int:
         # ⚠️ 关键修正：仓位必须从「实际会挂出的止损」反推，而不是用 2×ATR 估算的止损
         #    （此前两者不一致：实测名义 $13 按 3.96% 止损算出预算 $0.515，实际止损只有 0.916%，
         #      真实风险 $0.119；若实际止损更宽则会超预算 → 1% 风险变成空话）
+        # ── 时段闸门（tradfi 专用；实测休市时段每小时成交额仅为开盘的 1/3，周末仅 1/6）──
+        phase = us_session()
+        stop_dist_est = abs(price - plan["stop"]) / price * 100
+        sg_ok, sg_mult, sg_reason = session_gate(klass, phase, state["market_structure"].get("spread_bps"),
+                                                 stop_dist_est)
+        if sg_reason:
+            lines.append(f"　→ 时段闸门（{phase['label']}）：{sg_reason}")
+            rec["session_phase"] = phase["phase"]
+            rec["session_gate"] = sg_reason
+        if not sg_ok:
+            record(TRADES_LOG, rec)
+            continue
         venue_min = (gated["sizing"] or {}).get("venue_min_notional_usdt")
-        sz = size_from_plan(wallet, 0.01 * gated["size_multiplier"], price, plan["stop"],
+        sz = size_from_plan(wallet, 0.01 * gated["size_multiplier"] * sg_mult, price, plan["stop"],
                             a.leverage, venue_min)
         if not sz["ok"]:
             lines.append(f"　→ 仓位反推失败：{sz['reason']}，跳过")
@@ -404,7 +468,8 @@ def main() -> int:
         rec["risk_usd"] = round(risk_budget, 4)
         rec["sizing_basis"] = "按实际挂单止损反推（非 2×ATR 估算）"
         lines.append(f"　→ 仓位：名义 ${notional:,.2f}（按实际止损 {stop_dist_pct:.2f}% 反推，"
-                     f"风险 ${risk_budget:.4f} = 权益 {a.profile} 的 {gated['size_multiplier']}% 档）")
+                     f"风险 ${risk_budget:.4f}；档位系数 {gated['size_multiplier']}"
+                     f"{'×时段系数 ' + str(sg_mult) if sg_mult != 1.0 else ''}）")
         if not live:
             lines.append(f"　→ [dry-run] 将下 {side} 名义 ${notional:,}，止损 {plan['stop']} 止盈 {plan['tp1']}（RR {plan['rr']}）")
             record(TRADES_LOG, rec)
