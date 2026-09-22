@@ -154,6 +154,20 @@ python3 ~/.hermes/skills/finance/investment-analysis/scripts/audit_memo.py \
 
 4. **写报告**：按 `references/crypto.md` 的 8 章结构（场所档案 → 市场结构 → 多周期技术 → 资金面与仓位 → 代币经济 → 多空激辩 → 交易计划 → 风控官审批 → 一页结论）。**必须包含**：杠杆+保证金+止损+估强平价、`强平距离≥1.5×止损距离` 校验、资金费率持有成本、滑点约束下的名义上限、2–3 条可观测失效条件。
 
+4.5 **决策层（单次可证伪决策，借鉴 jev-trader 的 TypeSafe 范式）**：备忘录给的是叙事与计划；若要**可统计、可回填**的单次决策，用：
+   ```bash
+   python3 ~/.hermes/skills/finance/investment-analysis/scripts/crypto_decide.py BTCUSDT \
+           --profile swing --equity 10000 --leverage 5      # 真实 TypeSafe 决策（一次请求问 4 个原子问题）
+   python3 .../crypto_decide.py BTCUSDT --model mock        # 启发式替身，仅用于管线自测（不可作交易依据）
+   python3 .../crypto_decide.py --resolve                   # 回填历史决策结果，按「动作×置信度桶」统计命中率
+   ```
+   - **代码构建相对化状态**（bps 收益/盘口失衡/深度分档/CVD/资金费率与 OI 拥挤度/成本），模型只做判断
+   - 一次请求并行四问：`direction`(Choice，criteria 写明往返成本阈值) + `crowding`(Score) + `executability`(Score) + `invalidation_clarity`(Noul)；代码归一化加权成 conviction（`swing`/`scalp` 两套权重）
+   - **置信度门控**：`conf < 0.55`(swing)/`0.65`(scalp) → 观望；`0.55~0.75` → 半仓；`≥0.75` → 标准仓
+   - **代码侧硬门控**：成本 > 典型波幅 1/3 → 观望；盘口深度不足 → 观望；**RR < 2 或爆仓距离不达标 → 观望**
+   - 账本 `~/crypto_snapshots/decisions.jsonl`（含 `executed` 标记，被否决的决策不计入胜率）
+   - **注意**：同一状态复跑，模型动作可能在 long/short 间翻转且置信度偏低 → **这正是门控存在的理由**；mock 替身的方向判断可与真实模型完全相反，仅供管线测试
+
 5. **数字审计（必跑）**：
    ```bash
    python3 ~/.hermes/skills/finance/investment-analysis/scripts/audit_memo.py \
@@ -173,6 +187,7 @@ python3 ~/.hermes/skills/finance/investment-analysis/scripts/audit_memo.py \
 | HTX 公开 API | 资金费率+历史/OI/深度/行情 | 用户所在场所；跨场所资金费率差为独立信号（脚本已标注"历史均值口径"） |
 | **dogdoing.ai** 公开 JSON 接口 | 社交热度、AI 情绪与摘要、OI 背离、链上代币信息、合约审计、KOL 观点、预测市场、Alpha 热点、涨跌幅榜、资讯、恐惧贪婪 | `square-hype` `sentiment` `oi-divergence` `token-info` `token-audit` `serenity-tweets` `prediction-markets` `hotspots` `gainers` `losers` `news` `fear-greed` `market-tickers` `klines`；**其价格仅作交叉校验，不作权威价** |
 | 交易所 API（后续执行） | 下单/持仓/保证金 | 用户已明确后续执行走交易所 API |
+| **TypeSafe（jev-latest）** | 单次决策的语义判断（方向/拥挤度/可执行性/失效清晰度） | 决策层用；`TYPESAFE_API_KEY` 已在环境中；与数据源无关，不引入行情数据 |
 
 **已移除**：CoinGecko（全网市值/FDV/全市场/BTC占比/稳定币）与 alternative.me（情绪指数）—— 用户明令数据源只用上述两类；对应字段在报告中改为"无数据源，未核验"，**禁止用其他来源补**。
 

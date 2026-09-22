@@ -31,6 +31,7 @@
   - **dogdoing.ai** 公开 JSON 接口：社交热度榜、AI 情绪与摘要、OI 背离、链上代币信息（市值/FDV/持有人/Top10 集中度/流动性）、合约审计、KOL 观点、预测市场、Alpha 热点、涨跌幅榜、资讯、恐惧贪婪指数
   - 输出**波动率目标仓位表**（名义头寸/隐含杠杆/交易所杠杆/保证金/估强平价/爆仓距离校验），并区分「隐含杠杆」与「交易所杠杆」
 - 已移除 CoinGecko 与 alternative.me；**无全网市值/BTC 占比/稳定币数据源**，报告中不得出现此类结论
+- **决策层** `scripts/crypto_decide.py`：借鉴 [jarrodwatts/jev-trader](https://github.com/jarrodwatts/jev-trader) 的 TypeSafe 范式 —— 代码构建相对化状态 → 一次请求并行四问 → **置信度门控** → 代码侧硬约束（成本/RR≥2/爆仓距离）→ 写入 `decisions.jsonl` 账本；`--resolve` 回填结果并按「动作 × 置信度桶」统计命中率。详见 `references/jev-patterns.md`
 - **研究版**（`references/crypto-research.md`）：长期代币研究框架（Tokenomics / NVT / TVL / 活跃地址 / 解锁日历），链上数据多需付费接口，取不到必须标注"未核验"。
 
 ## 质量门（两轨共用）
@@ -46,12 +47,14 @@ investment-analysis/
 ├── scripts/
 │   ├── equity_snapshot.py         # 股票数据引擎（yfinance）
 │   ├── crypto_snapshot.py         # 加密数据引擎（交易所API + 聚合层）
+│   ├── crypto_decide.py           # 单次决策引擎（TypeSafe 单点决策 + 置信度门控 + 账本）
 │   └── audit_memo.py              # 数字审计质量门
 ├── references/
 │   ├── fundamentals.md            # 股票基本面模板
 │   ├── technical.md               # 股票技术面模板
 │   ├── crypto.md                  # 加密交易模板（TypeSafe 判决驱动）
-│   └── crypto-research.md         # 加密研究版模板（保留）
+│   ├── crypto-research.md         # 加密研究版模板（保留）
+│   └── jev-patterns.md            # 借鉴自 jev-trader 的 TypeSafe 决策范式
 └── prompts/
     ├── fundamentals-prompt.md     # 纯 Prompt 正文（复制即用）
     ├── technical-prompt.md        # 纯 Prompt 正文（复制即用）
