@@ -26,7 +26,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import binance_exec as bx      # noqa: E402
@@ -156,6 +156,9 @@ def size_from_plan(wallet: float, risk_frac: float, price: float, stop: float,
 
 
 MAX_CONCURRENT_POSITIONS = 2      # 并发仓位上限（建仓慎重）
+MIN_HOLD_MINUTES = 30             # 护栏1：模型驱动的退出不得早于持仓 30 分钟（防噪声甩单）
+COOLDOWN_HOURS = 6                # 护栏2：同一标的平仓后 6 小时内不再开仓（防 churn 循环）
+MAX_ENTRIES_PER_DAY = 4           # 护栏3：每日新开仓上限（防高频扫描放大开仓次数）
 CORR_MAX = 0.70                   # 与现有持仓的相关性上限：超过即视为"同一个押注"，不再开新仓
 
 
@@ -186,6 +189,47 @@ def corr_with_open(symbol: str, open_syms: list[str], bars: int = 90) -> tuple[f
     return round(worst, 3), worst_sym
 
 
+def ledger_rows() -> list[dict]:
+    if not os.path.exists(TRADES_LOG):
+        return []
+    return [json.loads(l) for l in open(TRADES_LOG, encoding="utf-8") if l.strip()]
+
+
+def cooldown_ok(symbol: str, rows: list[dict]) -> tuple[bool, str]:
+    """护栏2：该标的最新一次平仓后需冷却 COOLDOWN_HOURS"""
+    closes = [r for r in rows if r.get("symbol") == symbol and r.get("event") == "position_management"
+              and r.get("action") == "CLOSE" and r.get("live")]
+    if not closes:
+        return True, ""
+    last = max(closes, key=lambda x: x.get("ts_utc") or "")
+    try:
+        t = datetime.fromisoformat(last["ts_utc"].replace("Z", "+00:00"))
+    except Exception:                                          # noqa: BLE001
+        return True, ""
+    mins = (datetime.now(timezone.utc) - t).total_seconds() / 60
+    if mins < COOLDOWN_HOURS * 60:
+        return False, f"冷却中（{mins:.0f} 分钟前刚平仓，需等满 {COOLDOWN_HOURS} 小时）"
+    return True, ""
+
+
+def daily_entry_budget(rows: list[dict]) -> tuple[bool, str]:
+    """护栏3：近 24 小时新开仓数量上限"""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    n = 0
+    for r in rows:
+        if not (r.get("executed") and r.get("symbol")):
+            continue
+        try:
+            t = datetime.fromisoformat(r["ts_utc"].replace("Z", "+00:00"))
+        except Exception:                                      # noqa: BLE001
+            continue
+        if t >= cutoff:
+            n += 1
+    if n >= MAX_ENTRIES_PER_DAY:
+        return False, f"近 24h 已开仓 {n} 笔，达上限 {MAX_ENTRIES_PER_DAY}"
+    return True, ""
+
+
 def manage_positions(positions: dict, live: bool, profile: str, lines: list) -> list:
     """持仓管理：论点反转/消失 → 平仓；论点弱化 → 收紧止损（已盈利时）；否则持有"""
     actions = []
@@ -208,19 +252,39 @@ def manage_positions(positions: dict, live: bool, profile: str, lines: list) -> 
         atr = state["trend_relative_bps"]["atr_pct_4h"] or 1.0
         T = cd.THESIS
         act, reason = "HOLD", ""
+        # 护栏1：最小持仓时间 —— 模型驱动的退出不得早于 MIN_HOLD_MINUTES（交易所侧止损/止盈不受影响）
+        held_min = None
+        _rows = ledger_rows()
+        if _rows:
+            my_entries = [r for r in _rows if r.get("symbol") == sym and r.get("executed")]
+            if my_entries:
+                try:
+                    t0 = datetime.fromisoformat(max(my_entries, key=lambda x: x["ts_utc"])["ts_utc"]
+                                                .replace("Z", "+00:00"))
+                    held_min = (datetime.now(timezone.utc) - t0).total_seconds() / 60
+                except Exception:                              # noqa: BLE001
+                    held_min = None
+        young = held_min is not None and held_min < MIN_HOLD_MINUTES
         # 上一次对同一标的的管理读数（用于"连续两次"确认，抑制单次噪声）
         hist = [json.loads(l) for l in open(TRADES_LOG, encoding="utf-8") if l.strip()] if os.path.exists(TRADES_LOG) else []
         prev = [h for h in hist if h.get("symbol") == sym and h.get("event") == "position_management"]
         prev_bad = bool(prev) and prev[-1].get("action") in ("CLOSE", "CLOSE_PENDING", "WEAK")
         extreme = p_pos < 0.30 or conf < 0.20          # 极端读数：立即处置，不等确认
         # ① 论点反转（模型明确反对持仓方向，且置信度够高）
-        if choice and choice != pos_dir and choice != "no_trade" and conf >= T["reverse_conf"]:
+        if young and not (extreme and prev_bad):
+            act, reason = "HOLD", (f"持仓仅 {held_min:.0f} 分钟（< {MIN_HOLD_MINUTES} 分钟护栏），"
+                                   f"模型读数为 概率 {p_pos:.2f}／置信度 {conf} → 暂不处置，避免噪声甩单")
+        elif choice and choice != pos_dir and choice != "no_trade" and conf >= T["reverse_conf"]:
             act, reason = "CLOSE", f"论点反转：Jev 现给 {choice}（置信度 {conf} ≥ {T['reverse_conf']}）"
         # ② 论点消失（极端值立即平；否则需连续两次读数确认）
         elif p_pos < T["gone_p"] or conf < T["gone_conf"]:
             why = f"持仓方向概率 {p_pos:.2f}／置信度 {conf}"
-            if extreme or prev_bad:
-                act, reason = "CLOSE", f"论点消失（{why}）" + ("，极端读数立即处置" if extreme else "，连续两次确认")
+            if extreme and prev_bad:
+                act, reason = "CLOSE", f"论点消失（{why}），极端读数 + 连续两次确认"
+            elif extreme:
+                act, reason = "CLOSE_PENDING", f"论点消失（{why}）极端读数但首次出现 → 待下次确认（高频巡检下防单次噪声）"
+            elif prev_bad:
+                act, reason = "CLOSE", f"论点消失（{why}），连续两次读数确认"
             else:
                 act, reason = "CLOSE_PENDING", f"论点消失待确认（{why}）—— 首次读数不平仓，防单次噪声甩单"
         # ③ 论点弱化 → 已盈利则收紧到保本/更优，未盈利则警告（连续两次弱化则平仓）
@@ -321,6 +385,7 @@ def main() -> int:
     wallet = float(acct.get("totalWalletBalance") or 0)
     lines.append(f"> 权益：钱包 {wallet:.2f} USDT ｜ 可用 {equity:.2f} USDT")
 
+    e_rows = ledger_rows()
     positions = open_positions()
     if positions:
         lines.append("> 现有持仓：" + "；".join(f"{s} {p['positionAmt']} @ {p['entryPrice']}" for s, p in positions.items()))
@@ -368,7 +433,17 @@ def main() -> int:
         if len(positions) >= MAX_CONCURRENT_POSITIONS:
             lines.append(f"\n**{sym}**：跳过 —— 已达并发仓位上限 {MAX_CONCURRENT_POSITIONS} 个")
             continue
-        # 建仓闸②：与现有持仓高度相关 = 同一个押注（防重复下注，如实盘中 MU/MUU 同源）
+        # 建仓闸②：同标的冷却（防"开→被噪声平→再开"的 churn 循环）
+        cd_ok, cd_why = cooldown_ok(sym, e_rows)
+        if not cd_ok:
+            lines.append(f"\n**{sym}**：跳过 —— {cd_why}")
+            continue
+        # 建仓闸③：每日开仓额度（防高频扫描放大开仓次数）
+        db_ok, db_why = daily_entry_budget(e_rows)
+        if not db_ok:
+            lines.append(f"\n**{sym}**：跳过 —— {db_why}")
+            continue
+        # 建仓闸④：与现有持仓高度相关 = 同一个押注（防重复下注，如实盘中 MU/MUU 同源）
         c, cw = corr_with_open(sym, list(positions.keys()))
         if cw and abs(c) > CORR_MAX:
             lines.append(f"\n**{sym}**：跳过 —— 与现有持仓 {cw} 相关性 {c}（>{CORR_MAX}），同一押注不重复下注")
