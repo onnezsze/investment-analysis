@@ -35,6 +35,8 @@ import crypto_decide as cd     # noqa: E402
 SWITCH = os.path.expanduser("~/.binance_futures_autotrade.on")
 TRADES_LOG = os.path.expanduser("~/crypto_snapshots/trades.jsonl")
 HALT_LOG = os.path.expanduser("~/crypto_snapshots/halt.log")
+# 注：2026-09-22 01:56 首轮真下单时，本记录尚未持久化 TypeSafe 原始返回（answers/state_hash 为 null），
+# 该缺陷已在本提交修复；两笔成交的决策来源另见 trades.jsonl 中的 provenance 补录记录。
 
 
 def live_mode(force_dry: bool) -> tuple[bool, str]:
@@ -160,13 +162,24 @@ def main() -> int:
             if rr and rr >= 2.0:
                 plan = {"entry": price, "stop": stop, "tp1": tp, "rr": round(rr, 2)}
 
+        import hashlib
+        state_hash = hashlib.sha256(
+            json.dumps(state, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()[:16]
         rec = {
             "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"), "symbol": sym,
             "perp_contract": state["perp_contract"], "venue": venue, "asset_class": klass,
             "scan_score": item.get("score"), "model": answers.get("model"),
-            "state_hash": None, "action": gated["action"], "confidence": gated["confidence"],
+            "questions_version": cd.QUESTIONS_VERSION, "state_hash": state_hash,
+            "latency_ms": answers.get("_latency_ms"), "usage": answers.get("usage"),
+            # ⬇️ 真钱交易的审计核心：TypeSafe 原始返回必须落盘，事后可复核
+            "answers": answers["answers"],
+            "probabilities": (answers["answers"].get("direction") or {}).get("probabilities"),
+            "action": gated["action"], "confidence": gated["confidence"],
+            "conviction": gated.get("conviction"), "conviction_parts": gated.get("conviction_parts"),
+            "cost_bps": gated.get("cost_bps"), "expected_move_bps": gated.get("expected_move_bps"),
             "verdict": gated["verdict"], "gates": gated["gates"], "sizing": gated["sizing"],
             "plan": plan, "executed": False, "order_result": None, "wallet_usdt": wallet,
+            "price_at_decision": state["market_structure"]["price"],
         }
 
         if not plan or not gated["size_multiplier"]:
