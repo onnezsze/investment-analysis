@@ -136,14 +136,21 @@ def manage_positions(positions: dict, live: bool, profile: str, lines: list) -> 
         atr = state["trend_relative_bps"]["atr_pct_4h"] or 1.0
         T = cd.THESIS
         act, reason = "HOLD", ""
+        # 上一次对同一标的的管理读数（用于"连续两次"确认，抑制单次噪声）
+        hist = [json.loads(l) for l in open(TRADES_LOG, encoding="utf-8") if l.strip()] if os.path.exists(TRADES_LOG) else []
+        prev = [h for h in hist if h.get("symbol") == sym and h.get("event") == "position_management"]
+        prev_bad = bool(prev) and prev[-1].get("action") in ("CLOSE", "CLOSE_PENDING", "WEAK")
+        extreme = p_pos < 0.30 or conf < 0.20          # 极端读数：立即处置，不等确认
         # ① 论点反转（模型明确反对持仓方向，且置信度够高）
         if choice and choice != pos_dir and choice != "no_trade" and conf >= T["reverse_conf"]:
             act, reason = "CLOSE", f"论点反转：Jev 现给 {choice}（置信度 {conf} ≥ {T['reverse_conf']}）"
-        # ② 论点基本消失
-        elif p_pos < T["gone_p"]:
-            act, reason = "CLOSE", f"论点消失：持仓方向概率 {p_pos:.2f} 低于下限 {T['gone_p']}"
-        elif conf < T["gone_conf"]:
-            act, reason = "CLOSE", f"论点消失：置信度 {conf} 低于下限 {T['gone_conf']}（方向概率 {p_pos:.2f}）"
+        # ② 论点消失（极端值立即平；否则需连续两次读数确认）
+        elif p_pos < T["gone_p"] or conf < T["gone_conf"]:
+            why = f"持仓方向概率 {p_pos:.2f}／置信度 {conf}"
+            if extreme or prev_bad:
+                act, reason = "CLOSE", f"论点消失（{why}）" + ("，极端读数立即处置" if extreme else "，连续两次确认")
+            else:
+                act, reason = "CLOSE_PENDING", f"论点消失待确认（{why}）—— 首次读数不平仓，防单次噪声甩单"
         # ③ 论点弱化 → 已盈利则收紧到保本/更优，未盈利则警告（连续两次弱化则平仓）
         elif p_pos < T["weaken_p"] or conf < 0.45:
             in_profit = (px > entry) if pos_dir == "short" else (px < entry)
@@ -183,6 +190,8 @@ def manage_positions(positions: dict, live: bool, profile: str, lines: list) -> 
                                           bx.fmt(abs(amt), bx.spec(sym)["step_size"]), "STOP_MARKET", new_stop)
                 detail["new_stop_resp"] = res
             lines.append(f"\n**{sym}** 持仓 {pos_dir} → **{'止损已收紧' if live else '[dry-run] 将收紧'}至 {new_stop}**｜{reason}")
+        elif act == "CLOSE_PENDING":
+            lines.append(f"\n**{sym}** 持仓 {pos_dir} → ⚠️ **{reason}**（下轮仍如此即平仓）")
         elif act == "WEAK":
             lines.append(f"\n**{sym}** 持仓 {pos_dir} → ⚠️ **{reason}**")
         else:
@@ -202,6 +211,7 @@ def main() -> int:
     ap.add_argument("--leverage", type=float, default=5.0)
     ap.add_argument("--equity-floor", type=float, default=85.0)
     ap.add_argument("--skip-manage", action="store_true", help="跳过持仓管理（仅用于测试扫描）")
+    ap.add_argument("--manage-only", action="store_true", help="只做持仓管理，不扫描新机会（高频循环用）")
     ap.add_argument("--dry", action="store_true")
     a = ap.parse_args()
 
@@ -220,7 +230,13 @@ def main() -> int:
         lines.append("\n### 一、持仓管理（论点复核）")
         manage_positions(positions, live, a.profile, lines)
         positions = open_positions()          # 管理后刷新
+        if a.manage_only:
+            print("\n".join(lines))
+            return 0
         lines.append("\n### 二、新机会扫描")
+    elif a.manage_only:
+        print(f"**持仓管理 · {ts}** ｜ 空仓，无需管理")
+        return 0
 
     if wallet < a.equity_floor:
         msg = f"权益 {wallet:.2f} < 地板 {a.equity_floor} → 停止开新仓"
