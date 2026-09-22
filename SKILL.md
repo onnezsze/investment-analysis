@@ -101,6 +101,18 @@ python3 ~/.hermes/skills/finance/investment-analysis/scripts/equity_snapshot.py 
 | 币种一致 | 港股 HKD、A股 CNY、美股 USD；跨国同业比较需说明币种与汇率口径 |
 | 篇幅 | 达标即止，不灌水；每个章节必须有结论句，不写"值得关注"这类空话 |
 
+**数字审计（必跑，机器对账）**：
+
+```bash
+python3 ~/.hermes/skills/finance/investment-analysis/scripts/audit_memo.py \
+        ~/investment_snapshots/memo_<TICKER>_<date>.md \
+        ~/investment_snapshots/snapshot_<TICKER>_<date>.json \
+        --extra "962.21,89.5,47.4"      # 已知来自官方财报/新闻/推算的数字，逗号分隔
+```
+
+输出三组：① 直接命中快照 ② 命中推导值/白名单 ③ **待确认来源**。
+**第③组的每个数字都必须逐条给出出处**（官方财报链接 / 新闻链接 / 计算过程）；给不出出处的就是编造，必须删除或改正后重跑，直到"待确认"只剩能解释的项。重跑取数脚本后必须重新审计（防陈旧数字）。
+
 ### Step 6 · 交付
 
 备忘录写到 `~/investment_snapshots/memo_<TICKER>_<YYYYMMDD>.md`，结构 = 模板原结构。交付时给：
@@ -131,7 +143,12 @@ JSON 关键路径：`meta`（名称/市场/行业/业务简介）· `quote` · `
 - **行业 slug 404**：`yf.Industry("Consumer Electronics")` 会 404，必须小写连字符（`consumer-electronics`）；脚本已容错并回退。
 - **港股/A股财报口径**：TENCENT 收入含投资收益等，净利率与 A股白酒不可直接横比；跨市场对比必须说明口径。
 - **`info` 偶发限流**：返回缺字段时重跑一次即可；若 `pe_ttm` 为空说明该字段没取到，不要写 0。
+- **yfinance 字段口径陷阱（实测踩到，脚本已修）**：
+  - `dividendYield` 不同版本口径不同（1.7 返回的 0.45 已是百分数）→ 一律用 `dividendRate / 价格` 现算，脚本已改。
+  - `info.freeCashflow` 与 `operatingCashflow` 口径不一致（存在明显低报）→ 用 `OCF(TTM) − 最近财年Capex`，脚本已改，字段名 `fcf_ttm_ocf_minus_capex`。
+  - 同业倍数会被币种污染（美股 ADR 的 PS、EU 公司的 EV/EBITDA）→ 脚本按"PS 与净利率矛盾""EV/EBITDA > 200"自动打 flag 并剔除，估值的同业中位数只能用 `peers.summary.clean_sample` 内的公司。
 - **分析师目标价币种**：港股目标价是 HKD、A股是 CNY，别按 USD 读。
+- **数据会随重跑微调**：写报告后若重跑脚本，必须重跑 Step 5 的数字审计（否则会出现"报告写 208.6%、快照实际 208.5%"这类陈旧数字）。
 - **不要用模型记忆里的价格**：一切以 snapshot 的 `meta.as_of` 时间戳为准；用户问"最新"时先看时间戳。
 - **免责声明**：技术面模板要求开篇粘贴原文，不可省略、不可缩短。
 
