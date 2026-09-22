@@ -351,6 +351,22 @@ def volume_by_hour(h1: pd.DataFrame) -> dict:
 
 # ───────────────────────── 衍生品 / 仓位 ─────────────────────────
 
+def resolve_perp_symbol(spot_symbol: str) -> tuple[str, str]:
+    """许多币的永续合约带 1000/1000000 乘数（如现货 PEPEUSDT ↔ 永续 1000PEPEUSDT）。
+    自动探测正确的永续符号，否则资金费率/OI/多空比会静默取不到。"""
+    cands = [spot_symbol]
+    base = spot_symbol.replace("USDT", "").replace("USDC", "")
+    ccy = spot_symbol[len(base):]
+    for mult in ("1000", "1000000"):
+        cands.append(f"{mult}{base}{ccy}")
+    for c in cands:
+        try:
+            if len(klines("binance", c, "4h", 5, "futures")):
+                return c, ("现货代码" if c == spot_symbol else f"永续带乘数：{c}（现货为 {spot_symbol}）")
+        except Exception:                       # noqa: BLE001
+            continue
+    return spot_symbol, "未探测到永续合约（可能无该合约）"
+
 def funding_block(symbol: str, htx_contract: str | None) -> dict:
     out: dict = {}
     pi = soft(lambda: get(f"{BIN_FUT}/fapi/v1/premiumIndex?symbol={symbol}"))
@@ -935,17 +951,20 @@ def build(symbol: str, venue: str, equity: float, risk: float, use_dd: bool = Tr
             f"[FATAL] {symbol} 在币安现货与永续均无 K 线。请确认：\n"
             f"  · 代码格式（USDT 本位永续用 BTCUSDT 形式）\n"
             f"  · 该币是否只在币安 Alpha/链上/其他交易所（本引擎仅覆盖币安与 HTX 上线的交易对）")
+    perp_symbol, perp_note = resolve_perp_symbol(symbol)
     try:
-        fut_4h = klines("binance", symbol, "4h", 400, "futures")
+        fut_4h = klines("binance", perp_symbol, "4h", 400, "futures")
     except Exception:                                     # noqa: BLE001
         fut_4h = pd.DataFrame()
         gaps.append("币安永续 4H K线未取到（可能仅有现货）")
+    if perp_symbol != symbol:
+        gaps.append(f"衍生品数据（资金费率/OI/多空比/深度）取自永续合约 {perp_symbol}，与现货代码 {symbol} 不同口径，已自动映射")
 
     price = _f(spot_4h["Close"].iloc[-1], 6) if len(spot_4h) else None
     if price is None:
         raise SystemExit(f"[FATAL] 无法获取 {symbol} 行情，请确认为币安/HTX 上线交易对（如 BTCUSDT）")
 
-    pi = soft(lambda: get(f"{BIN_FUT}/fapi/v1/premiumIndex?symbol={symbol}")) or {}
+    pi = soft(lambda: get(f"{BIN_FUT}/fapi/v1/premiumIndex?symbol={perp_symbol}")) or {}
     tk24 = soft(lambda: get(f"{BIN_SPOT}/api/v3/ticker/24hr?symbol={symbol}")) or {}
     mark = _f(pi.get("markPrice"), 6) or price
     basis_bps = _f((mark / price - 1) * 10000, 1) if price else None
@@ -1003,7 +1022,7 @@ def build(symbol: str, venue: str, equity: float, risk: float, use_dd: bool = Tr
     if not vol_hour:
         gaps.append("分时段流动性分布未取到")
 
-    positioning = positioning_block(symbol)
+    positioning = positioning_block(perp_symbol)
     oi_now = (positioning.get("open_interest") or {}).get("current_usd") or 0
 
     d = {
@@ -1014,6 +1033,7 @@ def build(symbol: str, venue: str, equity: float, risk: float, use_dd: bool = Tr
                  "last_bar_4h_utc": str(spot_4h.index[-1])[:19] if len(spot_4h) else None,
                  "trading_hours": "7x24 连续，无收盘与隔夜缺口",
                  "data_sources": "Binance 公开API + HTX 公开API + dogdoing.ai 聚合层（仅此两类）",
+                 "perp_symbol": perp_symbol, "perp_symbol_note": perp_note,
                  "reviewed_by": "TypeSafe jev-1.13.0（可迁移性1.50 / 仓位模型0.98 / 场所风险0.95）"},
         "price": {"mark_price": mark, "spot_price": price, "basis_bps": basis_bps,
                   "change_24h_pct": _f(tk24.get("priceChangePercent"), 2),
@@ -1027,7 +1047,7 @@ def build(symbol: str, venue: str, equity: float, risk: float, use_dd: bool = Tr
                        "levels_4h": swing_levels(spot_4h),
                        "liquidation_magnets": liquidation_magnet(spot_4h, oi_now)},
         "volatility": vol,
-        "funding": funding_block(symbol, htx_contract if venue in ("both", "htx") else None),
+        "funding": funding_block(perp_symbol, htx_contract if venue in ("both", "htx") else None),
         "positioning": positioning,
         "liquidity": {**liq, "session_profile": vol_hour},
         "relative_strength": rs,
