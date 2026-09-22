@@ -1,40 +1,88 @@
 # Investment Analysis 技能
 
-用一套对冲基金投研级别的**多角色分析框架**，对某只股票产出**机构级投资备忘录 (Investment Memo)**。跨 Hermes / Claude / GPT 三端通用。
+**丢一个代码就跑的投资分析工作流**：股票用财报/估值，加密用资金费率/杠杆/场所 —— 双轨，跨 Hermes / Claude / GPT 三端通用。
 
-## 模块
+## 两条轨道
+
+### A. 股票（`references/fundamentals.md` · `references/technical.md`）
 
 - **基本面全流程**：分析师团队情报 4 份报告 → 投研团队多空辩论 → 交易主管执行计划 → 首席投资官审批。
 - **技术面深度分析**：风险前置免责声明 → 量化数据仪表盘 → 多维时间框架共振 → 相对强度与波动率 → 交易剧本与风险矩阵 → 最终建议。
-- **加密货币适配**（`references/crypto.md`）：面向代币/币种（BTC/ETH/SOL/Alt）的机构级框架——Tokenomics、链上数据与资金面、衍生品（资金费率/OI）、ETF 与稳定币流向、加密技术面（vs BTC 相对强弱、BTC.D）。
+- **数据引擎**：`scripts/equity_snapshot.py`（yfinance）——一条命令取全三年财报、估值倍数、同业对标、日线/周线/4小时三周期指标、ATR/布林带宽分位、量价分布、斐波那契、相对强弱、分析师与机构持仓。
+
+### B. 加密货币永续合约（`references/crypto.md` · `prompts/crypto-prompt.md`）
+
+面向 **BTCUSDT / SOLUSDT 等 USDT 本位永续**的交易备忘录。结构由 TypeSafe（jev-1.13.0）对"股票工作流能否用于加密"的结构化判决驱动：
+
+| 判断 | 结果 | 改造 |
+|---|---|---|
+| 整体可迁移性 | Score 1.50 | 只复用技术面+辩论结构，**数据层整体替换** |
+| 基本面锚缺失 | Score 2.86（严重） | 删除估值/护城河/管理层，改为资金费率+OI+代币经济；**禁止编造财报类结论** |
+| 周期错配 | Noul 0.80 | 主决策周期改 **4H**（1H 执行 / 日线看结构） |
+| 衍生品盲区 | Noul 0.94 | 强制纳入资金费率、OI、多空比、主动买卖比、OI 背离 |
+| 场所风险缺口 | Noul 0.95 | 量化价差/深度/滑点/跨场所资金费率差 + 场所风险清单 |
+| 仓位模型 | Choice 0.98 | **波动率目标仓位 + 杠杆上限 + 爆仓距离校验** |
+| 清算数据 | Noul 0.74 | 清算聚集代理价位，止损避开清算簇 |
+| 链上必要性 | Noul 0.68 | 解锁悬顶/市值占FDV/稳定币净发行；不可核验时降级 |
+| 最值得保留 | Choice 0.73 | **数字审计质量门原样保留** |
+
+- **数据引擎**：`scripts/crypto_snapshot.py` —— Binance + HTX 公开 API（行情/资金费率/OI/多空比/订单簿深度与滑点模拟/分时段流动性）+ dogdoing.ai 聚合层（社交热度/OI 背离/资讯）+ CoinGecko（市值/FDV/解锁悬顶）+ 恐惧贪婪指数，并输出**波动率目标仓位表（含保证金、估强平价、爆仓距离校验）**。
+- **研究版**（`references/crypto-research.md`）：长期代币研究框架（Tokenomics / NVT / TVL / 活跃地址 / 解锁日历），链上数据多需付费接口，取不到必须标注"未核验"。
+
+## 质量门（两轨共用）
+
+`scripts/audit_memo.py` —— 把备忘录里每个数字回头对账数据快照，输出「直接命中 / 推导命中 / **待确认来源**」三组。待确认的每个数字都必须给出出处（官方财报 / 新闻链接 / 计算过程），给不出即视为编造。实测：NVDA 备忘录 314 个数字 100% 可回溯；BTCUSDT 备忘录 194 个数字 100% 可回溯。
 
 ## 目录结构
 
 ```
 investment-analysis/
-├── SKILL.md                     # Hermes 技能说明(触发条件/流程/注意事项)
-├── README.md                    # 本说明
+├── SKILL.md                       # Hermes 技能说明（触发条件/流程/坑/自查）
+├── README.md                      # 本说明
+├── scripts/
+│   ├── equity_snapshot.py         # 股票数据引擎（yfinance）
+│   ├── crypto_snapshot.py         # 加密数据引擎（交易所API + 聚合层）
+│   └── audit_memo.py              # 数字审计质量门
 ├── references/
-│   ├── fundamentals.md          # 基本面模板(带解析说明的版)
-│   └── technical.md             # 技术面模板(带解析说明的版)
+│   ├── fundamentals.md            # 股票基本面模板
+│   ├── technical.md               # 股票技术面模板
+│   ├── crypto.md                  # 加密交易模板（TypeSafe 判决驱动）
+│   └── crypto-research.md         # 加密研究版模板（保留）
 └── prompts/
-    ├── fundamentals-prompt.md   # 纯 Prompt 正文(首行=总体指令)
-    └── technical-prompt.md      # 纯 Prompt 正文(首行=角色)
+    ├── fundamentals-prompt.md     # 纯 Prompt 正文（复制即用）
+    ├── technical-prompt.md        # 纯 Prompt 正文（复制即用）
+    ├── crypto-prompt.md           # 加密交易版纯 Prompt（含自检清单）
+    └── crypto-research-prompt.md  # 加密研究版纯 Prompt（保留）
 ```
 
-## 用法(三端通用)
+## 用法
 
-### Claude / GPT(或任何大模型)
-直接把 `prompts/fundamentals-prompt.md` 或 `prompts/technical-prompt.md` 的**全文**粘贴进对话，然后把其中的 `[股票代码]` / `【市场/交易所】` 替换为目标标的即可。两个文件的首行就是 Prompt 正文，无任何 Markdown 包装，复制即用。
+### 命令行（Hermes Agent / 任意终端）
+
+```bash
+# 股票
+python3 scripts/equity_snapshot.py NVDA
+python3 scripts/equity_snapshot.py 600519.SS --peers 000858.SZ,000568.SZ,600809.SH,002304.SZ
+python3 scripts/equity_snapshot.py 0700.HK
+
+# 加密永续
+python3 scripts/crypto_snapshot.py BTCUSDT --equity 10000 --leverage 5
+python3 scripts/crypto_snapshot.py WIFUSDT --equity 5000 --venue both
+
+# 数字审计
+python3 scripts/audit_memo.py memo_NVDA_20260922.md snapshot_NVDA_20260922.json --extra "..."
+```
+
+依赖：`yfinance pandas numpy`（股票）；加密引擎只依赖 `pandas numpy` + 标准库。
+
+### Claude / GPT（或任何大模型）
+
+把 `prompts/` 下对应文件的**全文**粘贴进对话，替换 `{...}` 占位符即可。四个文件首行即 Prompt 正文，无 Markdown 包装，复制即用。
 
 ### Hermes Agent
-本仓库即标准 skill 目录（`SKILL.md` + `references/`）。加载后，对 Hermes 说“分析/调研/研究某只股票”即自动套用；Hermes 会用真实工具抓行情、财报、分析师评级、13F 持仓等数据落地，而非空泛套话。
 
-### 落地要求
-- 数据一律来自真实抓取来源（`web_search` / `web_extract` / `browser_exec`），**禁止编造数字**。
-- 报告开头必须保留免责声明，明确“不构成投资建议”。
-- 技术指标结论仅作概率性推演，需声明局限性。
+直接说"分析 NVDA"或"分析 BTCUSDT 永续，权益 1 万"，技能会自动触发并走对应轨道。
 
-## 源码托管
+## 免责声明
 
-模板原文整理自 **Lucas (htxlucas)**。本仓库为公开托管；Hermes 实际在 `~/.hermes/skills/finance/investment-analysis/` 加载。
+本项目所有输出均为基于公开数据的概率性推演，**不构成任何投资建议**。加密资产（尤其杠杆衍生品）存在本金全损风险。请自行完成独立尽调。

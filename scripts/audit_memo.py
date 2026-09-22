@@ -43,6 +43,11 @@ def leaf_numbers(obj, out=None):
     elif isinstance(obj, str):
         for m in UNIT_RE.finditer(obj):          # "441.55B" / "5.49T" / "1.35M"
             out.add(float(m.group(1).replace(",", "")) * UNIT_MULT[m.group(2)])
+        for m in re.finditer(r"\d[\d,]*\.?\d*", obj):   # 新闻正文里的裸数字（如「冲破 82000 美元」）
+            try:
+                out.add(float(m.group(0).replace(",", "")))
+            except ValueError:
+                pass
     return out
 
 
@@ -64,13 +69,21 @@ def num_variants(x: float) -> set[str]:
                 v.add(f"{y:,.{nd}f}")
             except (ValueError, OverflowError):
                 pass
+    # 百分数口径：小额费率/比率常以 % 书写（0.00008347 → 0.008347）
+    for nd in (2, 3, 4, 5, 6):
+        p = x * 100
+        v.add(f"{p:.{nd}f}")
+        try:
+            v.add(f"{p:,.{nd}f}")
+        except (ValueError, OverflowError):
+            pass
     return v
 
 
 def derived_pool(nums: set[float]) -> set[str]:
     """从快照数值派生的常见计算：百分比变化、占比、比率、风险回报比"""
     pool = set()
-    vals = [n for n in nums if n != 0][:600]
+    vals = [n for n in nums if n != 0][:320]   # 限制样本量，避免 O(n²) 过慢
     for a in vals:
         for b in vals:
             if a is b:
