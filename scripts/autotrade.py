@@ -84,6 +84,29 @@ def record(path: str, rec: dict) -> None:
         f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
 
 
+def size_from_plan(wallet: float, risk_frac: float, price: float, stop: float,
+                   leverage: float, venue_min_notional: float | None) -> dict:
+    """从「实际挂单止损」反推仓位（风险预算 = wallet × risk_frac）。
+    返回 notional / risk_usd / stop_distance_pct / ok / reason。"""
+    if price <= 0 or stop <= 0:
+        return {"ok": False, "reason": "价格或止损无效"}
+    dist_pct = abs(price - stop) / price * 100
+    if dist_pct <= 0:
+        return {"ok": False, "reason": "止损距离为 0"}
+    risk_usd = wallet * risk_frac
+    notional = risk_usd / (dist_pct / 100)
+    capped = False
+    if leverage and notional > wallet * leverage:
+        notional = wallet * leverage
+        capped = True
+    if venue_min_notional and notional < venue_min_notional:
+        return {"ok": False, "stop_distance_pct": round(dist_pct, 3), "notional_usd": round(notional, 2),
+                "reason": f"名义 ${notional:.2f} 低于合约最小名义 ${venue_min_notional}"}
+    return {"ok": True, "stop_distance_pct": round(dist_pct, 3), "notional_usd": round(notional, 2),
+            "risk_usd": round(risk_usd, 4), "margin_usd": round(notional / leverage, 2) if leverage else None,
+            "capped_by_leverage": capped}
+
+
 MAX_CONCURRENT_POSITIONS = 2      # 并发仓位上限（建仓慎重）
 CORR_MAX = 0.70                   # 与现有持仓的相关性上限：超过即视为"同一个押注"，不再开新仓
 
@@ -351,6 +374,9 @@ def main() -> int:
             "verdict": gated["verdict"], "gates": gated["gates"], "sizing": gated["sizing"],
             "plan": plan, "executed": False, "order_result": None, "wallet_usdt": wallet,
             "price_at_decision": state["market_structure"]["price"],
+            # 实际风险额（USD）= 名义 × 止损距离，用于事后计算 R 倍数
+            "risk_usd": (round(gated["sizing"]["notional_usd"] * gated["sizing"]["stop_distance_pct"] / 100, 4)
+                         if gated.get("sizing") else None),
         }
 
         if not plan or not gated["size_multiplier"]:
@@ -358,10 +384,27 @@ def main() -> int:
             record(TRADES_LOG, rec)
             continue
 
-        notional = gated["sizing"]["notional_usd"]
+        # ⚠️ 关键修正：仓位必须从「实际会挂出的止损」反推，而不是用 2×ATR 估算的止损
+        #    （此前两者不一致：实测名义 $13 按 3.96% 止损算出预算 $0.515，实际止损只有 0.916%，
+        #      真实风险 $0.119；若实际止损更宽则会超预算 → 1% 风险变成空话）
+        venue_min = (gated["sizing"] or {}).get("venue_min_notional_usdt")
+        sz = size_from_plan(wallet, 0.01 * gated["size_multiplier"], price, plan["stop"],
+                            a.leverage, venue_min)
+        if not sz["ok"]:
+            lines.append(f"　→ 仓位反推失败：{sz['reason']}，跳过")
+            record(TRADES_LOG, rec)
+            continue
+        stop_dist_pct, notional, risk_budget = sz["stop_distance_pct"], sz["notional_usd"], sz["risk_usd"]
+        if sz.get("capped_by_leverage"):
+            lines.append(f"　→ 名义受杠杆上限约束，压至 ${notional:,.2f}")
         side = "buy" if gated["action"] == "long" else "sell"
         rec["planned_notional"] = notional
         rec["planned_side"] = side
+        rec["actual_stop_distance_pct"] = round(stop_dist_pct, 3)
+        rec["risk_usd"] = round(risk_budget, 4)
+        rec["sizing_basis"] = "按实际挂单止损反推（非 2×ATR 估算）"
+        lines.append(f"　→ 仓位：名义 ${notional:,.2f}（按实际止损 {stop_dist_pct:.2f}% 反推，"
+                     f"风险 ${risk_budget:.4f} = 权益 {a.profile} 的 {gated['size_multiplier']}% 档）")
         if not live:
             lines.append(f"　→ [dry-run] 将下 {side} 名义 ${notional:,}，止损 {plan['stop']} 止盈 {plan['tp1']}（RR {plan['rr']}）")
             record(TRADES_LOG, rec)
