@@ -48,7 +48,26 @@ def live_mode(force_dry: bool) -> tuple[bool, str]:
     return False, f"主开关不存在（{SWITCH}）→ 只记账不下单"
 
 
-def load_watchlist(n: int, include_tradfi: bool) -> list[dict]:
+def scan_mix(n: int, include_tradfi: bool) -> tuple[int, int]:
+    """时段感知的候选配额（crypto, tradfi）。
+    依据：tradfi 成交额高度集中于美股现金时段（该时段仅占全天 27% 时间却占 29.5%-40.7% 成交额），
+    周末仅占 4%-5.7%（每小时约为工作日的 1/6），且休市时段的 tradfi 建仓大多会被时段闸门拦下。
+    故非现金时段主动降低 tradfi 候选配额，把名额让给 24/7 的加密标的。"""
+    if not include_tradfi:
+        return n, 0
+    phase = (us_session() or {}).get("phase")
+    if phase in ("weekend", "holiday"):
+        return n, 0                                    # 美股休市日：不扫 tradfi
+    if phase == "overnight":
+        t = max(1, n // 6)                             # 深夜：仅留 1/6 名额（保留宽止损标的的机会）
+        return n - t, t
+    if phase in ("premarket", "afterhours"):
+        t = max(1, n // 3)                             # 盘前/盘后：1/3 名额
+        return n - t, t
+    return (n + 1) // 2, n // 2                        # 现金时段：均衡
+
+
+def load_watchlist(n: int, include_tradfi: bool) -> list:
     """读取最新扫描榜单，取前 N 个可交易标的（tradfi 需显式开启）"""
     import glob
     files = sorted(glob.glob(os.path.join(os.path.expanduser("~"), "crypto_snapshots", "watchlist_*.json")))
@@ -63,14 +82,14 @@ def load_watchlist(n: int, include_tradfi: bool) -> list[dict]:
         if k == "tradfi" and not include_tradfi:
             continue
         groups[k].append(r)
-    out, i = [], 0
-    while len(out) < n and (i < len(groups["crypto"]) or i < len(groups["tradfi"])):
-        for k in ("crypto", "tradfi"):
-            if i < len(groups[k]) and len(out) < n:
-                r = groups[k][i]
-                out.append({"symbol": r.get("contract"), "venue": r.get("venue"),
-                            "asset_class": r.get("asset_class"), "score": r.get("opportunity_score")})
-        i += 1
+    quota_c, quota_t = scan_mix(n, include_tradfi)
+    picked = {"crypto": groups["crypto"][:quota_c], "tradfi": groups["tradfi"][:quota_t]}
+    out = []
+    for k in ("crypto", "tradfi"):
+        for r in picked[k]:
+            out.append({"symbol": r.get("contract"), "venue": r.get("venue"),
+                        "asset_class": r.get("asset_class"), "score": r.get("opportunity_score"),
+                        "class_rank": r.get("class_rank"), "class_size": r.get("class_size")})
     return out
 
 
@@ -164,12 +183,12 @@ def size_from_plan(wallet: float, risk_frac: float, price: float, stop: float,
 # 并发仓位：不再只看"个数"，而是「个数 + 组合热度(heat) + 相关性簇」三重约束
 # 依据实测相关性矩阵（4H，90根）：MU↔MUU=1.00；半导体簇 {AMD,TSLA,SOXL,INTC} 互相关 0.64-0.81；
 #   7/14 标的是 AI 半导体链。3 笔两两相关 0.55 时组合风险 = 1%×√(3+6×0.55) = 2.51%（独立时 1.73%）。
-MAX_CONCURRENT_POSITIONS = 3      # 并发仓位上限（2→3：可容纳"半导体 + 加密 + 大型互联网"三类真独立敞口）
-MAX_PORTFOLIO_HEAT_PCT = 3.0      # 组合热度上限：所有持仓的当前风险合计 ≤ 权益 3%（自适应的真约束）
+MAX_CONCURRENT_POSITIONS = 10     # 并发仓位上限（用户 2026-09-22 指定：不超过 10 个）
+MAX_PORTFOLIO_HEAT_PCT = 10.0     # 组合热度上限：10 笔 x 1% 风险 = 10%（与并发上限一致）
 CORR_CLUSTER_MAX = 0.60           # 相关性簇阈值（0.70→0.60：把半导体链算作同一个押注）
 MIN_HOLD_MINUTES = 30             # 护栏1：模型驱动的退出不得早于持仓 30 分钟（防噪声甩单）
 COOLDOWN_HOURS = 6                # 护栏2：同一标的平仓后 6 小时内不再开仓（防 churn 循环）
-MAX_ENTRIES_PER_DAY = 4           # 护栏3：每日新开仓上限（防高频扫描放大开仓次数）
+MAX_ENTRIES_PER_DAY = None        # 开仓额度不限制（用户 2026-09-22 指定）；填数字即恢复每日额度闸
 # （旧的 CORR_MAX 已被 CORR_CLUSTER_MAX 取代，见上方常量）
 
 
@@ -229,6 +248,16 @@ def portfolio_heat(positions: dict, equity: float) -> tuple[float, list]:
     return round(pct, 3), detail
 
 
+def margin_ok(notional: float, leverage: int, available: float, buffer: float = 0.95) -> tuple[bool, str]:
+    """保证金闸：所需保证金 = 名义/杠杆；留 5% 缓冲，超过可用余额则拒绝。
+    并发上限提到 10 后，这才是真正会卡住开仓的约束（1% 风险 x 1% 止损 → 名义≈权益，5x 下每笔占约 20% 保证金）。"""
+    need = notional / max(leverage, 1)
+    if need > available * buffer:
+        return False, (f"保证金不足：需 ${need:.2f}（名义 ${notional:.2f}/{leverage}x），"
+                       f"可用 ${available:.2f}，上限 ${available * buffer:.2f}")
+    return True, ""
+
+
 def cooldown_ok(symbol: str, rows: list[dict]) -> tuple[bool, str]:
     """护栏2：该标的最新一次平仓后需冷却 COOLDOWN_HOURS"""
     closes = [r for r in rows if r.get("symbol") == symbol and r.get("event") == "position_management"
@@ -259,6 +288,8 @@ def daily_entry_budget(rows: list[dict]) -> tuple[bool, str]:
             continue
         if t >= cutoff:
             n += 1
+    if MAX_ENTRIES_PER_DAY is None:                    # 开仓额度不限制（用户指定）
+        return True, ""
     if n >= MAX_ENTRIES_PER_DAY:
         return False, f"近 24h 已开仓 {n} 笔，达上限 {MAX_ENTRIES_PER_DAY}"
     return True, ""
@@ -418,6 +449,11 @@ def main() -> int:
     equity = float(acct.get("availableBalance") or 0)
     wallet = float(acct.get("totalWalletBalance") or 0)
     lines.append(f"> 权益：钱包 {wallet:.2f} USDT ｜ 可用 {equity:.2f} USDT")
+    _phase = us_session()
+    if a.scan:
+        _qc, _qt = scan_mix(a.scan, a.include_tradfi)
+        lines.append(f"> 美股时段：**{_phase.get('label')}**（现金时段 13:30-20:00 UTC）｜"
+                     f"本轮候选配额 加密 {_qc} / tradfi {_qt}")
 
     e_rows = ledger_rows()
     positions = open_positions()
@@ -595,6 +631,13 @@ def main() -> int:
                 lines.append(f"　→ 仓位反推失败：{sz['reason']}，跳过")
                 record(TRADES_LOG, rec)
                 continue
+        # 建仓闸④：保证金闸（拿到真实名义后校验；10 仓位下这才是真约束）
+        _mg_ok, _mg_why = margin_ok(sz["notional_usd"], a.leverage, available)
+        if not _mg_ok:
+            lines.append(f"　→ 跳过 —— {_mg_why}")
+            rec["margin_blocked"] = _mg_why
+            record(TRADES_LOG, rec)
+            continue
         stop_dist_pct, notional, risk_budget = sz["stop_distance_pct"], sz["notional_usd"], sz["risk_usd"]
         if sz.get("capped_by_leverage"):
             lines.append(f"　→ 名义受杠杆上限约束，压至 ${notional:,.2f}")
