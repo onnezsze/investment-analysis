@@ -191,13 +191,17 @@ def cost_state(symbol: str, px: float, notional: float, horizon_hours: float,
 
 
 PROFILES = {
-    # 建仓从严（2026-09-22 实盘后上调）：置信度门槛 +0.10、RR 门槛 2.0→2.5、新增"论点概率"下限
+    # 2026-09-22 第二次校准：**开仓门槛降回 0.55/0.60，标准仓门槛保持 0.85/0.88 不动**
+    #   依据：模型置信度系统性偏保守（中位 0.34），0.65 时仅 6.5% 决策通过（108 条里 7 条），
+    #   10 小时只成交 2 笔，样本积累过慢；降到 0.55 后通过率约 16.7%（2.5 倍）。
+    #   风险控制方式：新增交易一律为**半仓**（标准仓仍需 >=0.85），单笔风险由 1% 降为 0.5%；
+    #   RR>=2.5、相关性 0.60、组合热度 10%、保证金、最小名义、时段闸门、冷却、最小持仓时间全部不变。
     "swing": {"label": "波段（4H 主决策，持仓 1-3 天）", "horizon_hours": 24,
               "weights": {"direction": 0.45, "crowding": 0.20, "executability": 0.15, "invalidation": 0.20},
-              "conf_min_trade": 0.65, "conf_min_full": 0.85, "rr_min": 2.5, "p_dir_min": 0.55},
+              "conf_min_trade": 0.55, "conf_min_full": 0.85, "rr_min": 2.5, "p_dir_min": 0.55},
     "scalp": {"label": "短打（1H 主决策，持仓 2-8 小时）", "horizon_hours": 4,
               "weights": {"direction": 0.55, "crowding": 0.10, "executability": 0.25, "invalidation": 0.10},
-              "conf_min_trade": 0.70, "conf_min_full": 0.88, "rr_min": 2.5, "p_dir_min": 0.58},
+              "conf_min_trade": 0.60, "conf_min_full": 0.88, "rr_min": 2.5, "p_dir_min": 0.58},
 }
 # 论点失效/弱化的处置阈值（持仓管理用）
 THESIS = {"reverse_conf": 0.65,   # 反向论点置信度达到此值 → 平仓
