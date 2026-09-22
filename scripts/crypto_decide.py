@@ -176,13 +176,19 @@ def cost_state(symbol: str, px: float, notional: float, horizon_hours: float,
 
 
 PROFILES = {
+    # 建仓从严（2026-09-22 实盘后上调）：置信度门槛 +0.10、RR 门槛 2.0→2.5、新增"论点概率"下限
     "swing": {"label": "波段（4H 主决策，持仓 1-3 天）", "horizon_hours": 24,
               "weights": {"direction": 0.45, "crowding": 0.20, "executability": 0.15, "invalidation": 0.20},
-              "conf_min_trade": 0.55, "conf_min_full": 0.75},
+              "conf_min_trade": 0.65, "conf_min_full": 0.85, "rr_min": 2.5, "p_dir_min": 0.55},
     "scalp": {"label": "短打（1H 主决策，持仓 2-8 小时）", "horizon_hours": 4,
               "weights": {"direction": 0.55, "crowding": 0.10, "executability": 0.25, "invalidation": 0.10},
-              "conf_min_trade": 0.65, "conf_min_full": 0.85},
+              "conf_min_trade": 0.70, "conf_min_full": 0.88, "rr_min": 2.5, "p_dir_min": 0.58},
 }
+# 论点失效/弱化的处置阈值（持仓管理用）
+THESIS = {"reverse_conf": 0.65,   # 反向论点置信度达到此值 → 平仓
+          "gone_p": 0.40,         # 持仓方向概率跌破此值 → 平仓
+          "gone_conf": 0.30,      # 置信度跌破此值 → 平仓
+          "weaken_p": 0.52}       # 方向概率跌破此值 → 收紧止损
 
 
 def build_state(symbol: str, profile: str, equity: float, horizon_hours: float | None,
@@ -467,8 +473,8 @@ def gate_and_size(state: dict, answers: dict, profile: str) -> dict:
         verdict = "观望（缺少概率/置信度）"
     elif conf < prof["conf_min_trade"]:
         verdict = f"观望（置信度 {conf:.2f} < {prof['conf_min_trade']}：高风险动作要求更高置信度）"
-    elif dirv < 0.5:
-        verdict = f"观望（所选方向概率 {dirv:.2f} < 0.5，非正期望）"
+    elif dirv < prof["p_dir_min"]:
+        verdict = f"观望（所选方向概率 {dirv:.2f} < {prof['p_dir_min']}：证据不足，不做）"
     else:
         size_mult = 1.0 if conf >= prof["conf_min_full"] else 0.5
         verdict = ("按标准仓执行" if size_mult == 1.0 else

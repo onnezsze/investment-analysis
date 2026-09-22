@@ -188,7 +188,7 @@ def cmd_positions(_a) -> None:
 
 def cmd_orders(a) -> None:
     r = _req("GET", "/fapi/v1/openOrders", {"symbol": a.symbol} if a.symbol else None)
-    if r.get("_error"):
+    if isinstance(r, dict) and r.get("_error"):
         print(r)
         return
     if not r:
@@ -257,6 +257,23 @@ def cmd_order(a) -> None:
             print(f"   ⚠️ 保护单失败 → 建议立即平仓（python3 binance_exec.py close {a.symbol} --live）")
 
 
+def open_algo_orders(symbol: str | None = None) -> list:
+    r = _req("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol} if symbol else None)
+    return r if isinstance(r, list) else []
+
+
+def cancel_algo(algo_id: int) -> dict:
+    return _req("DELETE", "/fapi/v1/algoOrder", {"algoId": algo_id})
+
+
+def cancel_all_protective(symbol: str) -> list:
+    """撤销某标的的全部 algo 保护单（平仓前必须调用，避免残留条件单）"""
+    out = []
+    for o in open_algo_orders(symbol):
+        out.append({"algoId": o["algoId"], "type": o.get("orderType"), "resp": cancel_algo(o["algoId"])})
+    return out
+
+
 def place_protective(symbol: str, side: str, qty: str, kind: str, trigger: float) -> dict:
     """挂保护单。tradfi 合约不支持标准 STOP_MARKET，自动回退 Algo Order API
     （实测必需参数：algoType=CONDITIONAL + triggerPrice）"""
@@ -321,6 +338,8 @@ def main() -> int:
     sl = sub.add_parser("set-leverage"); sl.add_argument("symbol"); sl.add_argument("leverage", type=int); sl.set_defaults(fn=cmd_set_leverage)
     so = sub.add_parser("orders"); so.add_argument("symbol", nargs="?"); so.set_defaults(fn=cmd_orders)
     ss = sub.add_parser("stops"); ss.add_argument("symbol", nargs="?"); ss.set_defaults(fn=cmd_stops)
+    sq = sub.add_parser("cancel-stops"); sq.add_argument("symbol"); sq.set_defaults(fn=lambda a: print(
+        json.dumps(cancel_all_protective(a.symbol), ensure_ascii=False)))
     sc = sub.add_parser("close"); sc.add_argument("symbol"); sc.set_defaults(fn=cmd_close)
     so2 = sub.add_parser("order")
     so2.add_argument("symbol"); so2.add_argument("side", choices=["buy", "sell"])

@@ -83,6 +83,115 @@ def record(path: str, rec: dict) -> None:
         f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
 
 
+MAX_CONCURRENT_POSITIONS = 2      # 并发仓位上限（建仓慎重）
+CORR_MAX = 0.70                   # 与现有持仓的相关性上限：超过即视为"同一个押注"，不再开新仓
+
+
+def corr_with_open(symbol: str, open_syms: list[str], bars: int = 90) -> tuple[float, str | None]:
+    """候选标的与现有持仓的最大绝对相关性（4H 收益率，越长越稳）"""
+    import numpy as np
+    def series(s):
+        for mk in ("futures", "spot"):
+            try:
+                d = cd.cs.klines("binance", s, "4h", bars + 5, mk)
+                if len(d) > 30:
+                    return d["Close"].pct_change().dropna().values[-bars:]
+            except Exception:                              # noqa: BLE001
+                continue
+        return None
+    a = series(symbol)
+    if a is None:
+        return 0.0, None
+    worst, worst_sym = 0.0, None
+    for s in open_syms:
+        b = series(s)
+        if b is None or len(b) < 30:
+            continue
+        n = min(len(a), len(b))
+        c = float(np.corrcoef(a[-n:], b[-n:])[0, 1])
+        if abs(c) > abs(worst):
+            worst, worst_sym = c, s
+    return round(worst, 3), worst_sym
+
+
+def manage_positions(positions: dict, live: bool, profile: str, lines: list) -> list:
+    """持仓管理：论点反转/消失 → 平仓；论点弱化 → 收紧止损（已盈利时）；否则持有"""
+    actions = []
+    for sym, p in positions.items():
+        amt = float(p["positionAmt"])
+        entry = float(p["entryPrice"])
+        pos_dir = "long" if amt > 0 else "short"
+        try:
+            state = cd.build_state(sym, profile, float(p.get("notional", 0)) or 100.0, None, 5.0)
+            raw = cd.ts_request(state, profile)
+        except Exception as e:                                  # noqa: BLE001
+            lines.append(f"\n**{sym}** 持仓复核失败：{type(e).__name__} {str(e)[:80]}")
+            continue
+        d = raw["answers"]["direction"]
+        probs = d.get("probabilities") or {}
+        conf = d.get("confidence") or 0
+        choice = d.get("choice")
+        p_pos = float(probs.get(pos_dir) or 0)
+        px = state["market_structure"]["price"]
+        atr = state["trend_relative_bps"]["atr_pct_4h"] or 1.0
+        T = cd.THESIS
+        act, reason = "HOLD", ""
+        # ① 论点反转（模型明确反对持仓方向，且置信度够高）
+        if choice and choice != pos_dir and choice != "no_trade" and conf >= T["reverse_conf"]:
+            act, reason = "CLOSE", f"论点反转：Jev 现给 {choice}（置信度 {conf} ≥ {T['reverse_conf']}）"
+        # ② 论点基本消失
+        elif p_pos < T["gone_p"]:
+            act, reason = "CLOSE", f"论点消失：持仓方向概率 {p_pos:.2f} 低于下限 {T['gone_p']}"
+        elif conf < T["gone_conf"]:
+            act, reason = "CLOSE", f"论点消失：置信度 {conf} 低于下限 {T['gone_conf']}（方向概率 {p_pos:.2f}）"
+        # ③ 论点弱化 → 已盈利则收紧到保本/更优，未盈利则警告（连续两次弱化则平仓）
+        elif p_pos < T["weaken_p"] or conf < 0.45:
+            in_profit = (px > entry) if pos_dir == "short" else (px < entry)
+            if in_profit:
+                act, reason = "TIGHTEN", f"论点弱化（概率 {p_pos:.2f}／置信度 {conf}）且已盈利 → 收紧止损"
+            else:
+                hist = [json.loads(l) for l in open(TRADES_LOG, encoding="utf-8") if l.strip()] if os.path.exists(TRADES_LOG) else []
+                prev_weak = [h for h in hist if h.get("symbol") == sym and h.get("event") == "position_management"
+                             and h.get("action") == "WEAK"]
+                act, reason = ("CLOSE", "论点连续两次弱化且未盈利 → 平仓") if prev_weak else \
+                              ("WEAK", f"论点弱化（概率 {p_pos:.2f}／置信度 {conf}）但未盈利 → 标记，下轮再弱化即平仓")
+        else:
+            reason = f"论点成立：{pos_dir} 概率 {p_pos:.2f}（置信度 {conf}）"
+        # 执行
+        detail = {"event": "position_management", "symbol": sym, "pos_dir": pos_dir, "amount": amt,
+                  "entry": entry, "price": px, "choice": choice, "probabilities": probs,
+                  "p_pos": p_pos, "confidence": conf, "action": act, "reason": reason,
+                  "model": raw.get("model"), "usage": raw.get("usage"), "state_hash": None,
+                  "live": live, "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        if act == "CLOSE":
+            detail["cancelled_algo"] = None
+            detail["close_result"] = None
+            if live:
+                detail["cancelled_algo"] = bx.cancel_all_protective(sym)
+                r = bx._req("POST", "/fapi/v1/order",
+                            {"symbol": sym, "side": ("SELL" if amt > 0 else "BUY"), "type": "MARKET",
+                             "quantity": bx.fmt(abs(amt), bx.spec(sym)["step_size"]), "reduceOnly": "true"})
+                detail["close_result"] = r
+            lines.append(f"\n**{sym}** 持仓 {pos_dir} → **{'已平仓' if live else '[dry-run] 将平仓'}**｜{reason}")
+        elif act == "TIGHTEN":
+            new_stop = round(max(entry, px * (1 + 0.5 * atr / 100)), 4) if pos_dir == "short" else \
+                       round(min(entry, px * (1 - 0.5 * atr / 100)), 4)
+            detail["tighten_to"] = new_stop
+            if live:
+                detail["cancelled_algo"] = bx.cancel_all_protective(sym)
+                res = bx.place_protective(sym, "sell" if pos_dir == "short" else "buy",
+                                          bx.fmt(abs(amt), bx.spec(sym)["step_size"]), "STOP_MARKET", new_stop)
+                detail["new_stop_resp"] = res
+            lines.append(f"\n**{sym}** 持仓 {pos_dir} → **{'止损已收紧' if live else '[dry-run] 将收紧'}至 {new_stop}**｜{reason}")
+        elif act == "WEAK":
+            lines.append(f"\n**{sym}** 持仓 {pos_dir} → ⚠️ **{reason}**")
+        else:
+            lines.append(f"\n**{sym}** 持仓 {pos_dir} → 持有｜{reason}")
+        record(TRADES_LOG, detail)
+        actions.append(detail)
+    return actions
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="定时决策与执行（工作流原纪律）")
     ap.add_argument("--symbols", default=None, help="显式指定标的；不填则用 --scan")
@@ -92,6 +201,7 @@ def main() -> int:
     ap.add_argument("--profile", default="swing")
     ap.add_argument("--leverage", type=float, default=5.0)
     ap.add_argument("--equity-floor", type=float, default=85.0)
+    ap.add_argument("--skip-manage", action="store_true", help="跳过持仓管理（仅用于测试扫描）")
     ap.add_argument("--dry", action="store_true")
     a = ap.parse_args()
 
@@ -107,6 +217,10 @@ def main() -> int:
     positions = open_positions()
     if positions:
         lines.append("> 现有持仓：" + "；".join(f"{s} {p['positionAmt']} @ {p['entryPrice']}" for s, p in positions.items()))
+        lines.append("\n### 一、持仓管理（论点复核）")
+        manage_positions(positions, live, a.profile, lines)
+        positions = open_positions()          # 管理后刷新
+        lines.append("\n### 二、新机会扫描")
 
     if wallet < a.equity_floor:
         msg = f"权益 {wallet:.2f} < 地板 {a.equity_floor} → 停止开新仓"
@@ -129,6 +243,15 @@ def main() -> int:
             continue
         if sym in positions:
             lines.append(f"\n**{sym}**：已持仓，跳过（单标的一笔上限）")
+            continue
+        # 建仓闸①：并发仓位上限
+        if len(positions) >= MAX_CONCURRENT_POSITIONS:
+            lines.append(f"\n**{sym}**：跳过 —— 已达并发仓位上限 {MAX_CONCURRENT_POSITIONS} 个")
+            continue
+        # 建仓闸②：与现有持仓高度相关 = 同一个押注（防重复下注，如实盘中 MU/MUU 同源）
+        c, cw = corr_with_open(sym, list(positions.keys()))
+        if cw and abs(c) > CORR_MAX:
+            lines.append(f"\n**{sym}**：跳过 —— 与现有持仓 {cw} 相关性 {c}（>{CORR_MAX}），同一押注不重复下注")
             continue
         try:
             state = cd.build_state(sym, a.profile, wallet, None, a.leverage)
@@ -159,8 +282,11 @@ def main() -> int:
                 tp = round(sups[0], 6) if sups else round(price * (1 - atr * 5 / 100), 6)
             risk = abs(price - stop)
             rr = (abs(tp - price) / risk) if risk else None
-            if rr and rr >= 2.0:
+            rr_min = cd.PROFILES[a.profile].get("rr_min", 2.5)
+            if rr and rr >= rr_min:
                 plan = {"entry": price, "stop": stop, "tp1": tp, "rr": round(rr, 2)}
+            else:
+                lines.append(f"　→ RR {rr if rr is None else round(rr,2)} < 门槛 {rr_min}，不开仓")
 
         import hashlib
         state_hash = hashlib.sha256(
