@@ -448,7 +448,15 @@ def ts_request(state: dict, profile: str, timeout: int = 120, model: str = "jev-
     body = json.dumps({"state": state, "model": model, "questions": questions}).encode()
     req = urllib.request.Request(
         "https://api.typesafe.ai/v1/systemone", data=body,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+        # TypeSafe 在 Cloudflare 后面：默认 Python UA / 空 UA 会被 Error 1010 封禁
+        # （"banned your access based on your browser's signature"）。
+        # 实测：无 UA → 403/1010；浏览器 UA → 正常返回。故必须显式声明浏览器式 UA。
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": "application/json",
+                 "Accept": "application/json",
+                 "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/122.0.0.0 Safari/537.36")})
     t0 = time.time()
     for attempt in range(3):
         try:

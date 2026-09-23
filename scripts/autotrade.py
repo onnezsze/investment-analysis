@@ -569,6 +569,10 @@ def main() -> int:
             answers = cd.ts_request(state, a.profile)
             gated = cd.gate_and_size(state, answers["answers"], a.profile)
         except SystemExit as e:
+            # 接口故障/致命错误也必须落账（否则故障期在账本中无痕迹，无法审计）
+            record(TRADES_LOG, {"event": "error", "symbol": sym,
+                                "error": str(e)[:300],
+                                "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")})
             lines.append(f"\n**{sym}**：跳过（{e}）")
             continue
         except Exception as e:                                    # noqa: BLE001
